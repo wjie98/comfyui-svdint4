@@ -16,6 +16,7 @@ as `svdint4`.
 - Python 3.10 or newer
 - PyTorch with CUDA
 - CUDA toolkit with `nvcc`
+- CUDA sparse development headers (`cusparse.h`)
 - C++20-capable compiler
 - NVIDIA GPU, `sm_75` or newer
 
@@ -43,6 +44,22 @@ python -m pip install -v --no-build-isolation -e .
 ```
 
 On Windows, run from an x64 Visual Studio Developer shell.
+
+If a Windows conda build fails with `cusparse.h: No such file or directory`,
+install the CUDA sparse development headers into the same environment:
+
+```powershell
+conda install -n comfyui -c nvidia libcusparse-dev
+```
+
+If you use pip CUDA component packages instead:
+
+```powershell
+python -m pip install nvidia-cusparse-cu12
+```
+
+For custom CUDA Toolkit locations, set `SVDINT4_CUDA_INCLUDE_DIRS` to the
+directory containing `cusparse.h`.
 
 ## Check
 

@@ -13,6 +13,8 @@ normal ComfyUI LoRAs and should be applied after the SVDInt4 loader node.
 - Python 3.10 or newer
 - PyTorch with CUDA
 - CUDA toolkit with `nvcc` if installing from source
+- CUDA sparse development headers (`cusparse.h`) if your CUDA toolkit comes
+  from split conda or pip packages
 - ComfyUI
 
 The default source build targets `sm_75`, `sm_80`, `sm_86`, and `sm_89`.
@@ -53,6 +55,23 @@ python -m pip install -v --no-build-isolation \
 
 Use `--no-build-isolation` for local CUDA builds so pip uses the PyTorch already
 installed in your ComfyUI environment.
+
+On Windows conda environments, `nvcc` may be installed without the sparse CUDA
+headers that PyTorch includes need. If the build reports `cusparse.h: No such
+file or directory`, install the header package first:
+
+```powershell
+conda install -n comfyui -c nvidia libcusparse-dev
+```
+
+If you use pip CUDA component packages instead, install:
+
+```powershell
+python -m pip install nvidia-cusparse-cu12
+```
+
+For a custom CUDA Toolkit location, set `SVDINT4_CUDA_INCLUDE_DIRS` to the
+directory that contains `cusparse.h`.
 
 If you must use the SSH URL, initialize GitHub's SSH host key in the same
 Windows account first:
@@ -183,6 +202,20 @@ python -m pip install -v --no-build-isolation \
 
 Make sure the CUDA toolkit used by `nvcc` matches your PyTorch CUDA version.
 For source builds, also make sure `--no-build-isolation` is present.
+
+`fatal error C1083: ... cusparse.h: No such file or directory`
+
+Install CUDA sparse development headers in the ComfyUI environment:
+
+```powershell
+conda install -n comfyui -c nvidia libcusparse-dev
+```
+
+or:
+
+```powershell
+python -m pip install nvidia-cusparse-cu12
+```
 
 `Put SVDInt4 .safetensors files in ...`
 
