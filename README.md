@@ -23,7 +23,7 @@ Clone the plugin into ComfyUI:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone git@github.com:wjie98/comfyui-svdint4.git
+git clone https://github.com/wjie98/comfyui-svdint4.git
 ```
 
 The ComfyUI plugin itself has no heavy Python dependency. This lets ComfyUI
@@ -33,7 +33,7 @@ Install the CUDA kernel in the same Python environment that runs ComfyUI:
 
 ```bash
 python -m pip install -v --no-build-isolation \
-  "git+ssh://git@github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
 ```
 
 For local development from an already cloned checkout:
@@ -48,11 +48,23 @@ To limit the architectures built for your machine:
 ```bash
 SVDINT4_ARCH_LIST="8.0;8.6" \
 python -m pip install -v --no-build-isolation \
-  "git+ssh://git@github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
 ```
 
 Use `--no-build-isolation` for local CUDA builds so pip uses the PyTorch already
 installed in your ComfyUI environment.
+
+If you must use the SSH URL, initialize GitHub's SSH host key in the same
+Windows account first:
+
+```powershell
+New-Item -ItemType Directory -Force $env:USERPROFILE\.ssh | Out-Null
+ssh-keyscan github.com | Out-File -Append -Encoding ascii $env:USERPROFILE\.ssh\known_hosts
+ssh -T git@github.com
+```
+
+Verify the printed fingerprint against GitHub's published SSH key
+fingerprints before trusting the host key.
 
 ## Verify The Kernel
 
@@ -164,7 +176,7 @@ Install the kernel in the same environment that launches ComfyUI:
 
 ```bash
 python -m pip install -v --no-build-isolation \
-  "git+ssh://git@github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
 ```
 
 `CUDA version mismatches the version that was used to compile PyTorch`
