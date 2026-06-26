@@ -191,6 +191,19 @@ PyTorch extension headers from the binding file, which could pull in PyTorch
 CUDA sparse headers on Windows. The current binding uses lighter ATen/pybind
 headers and does not require `cusparse.h` directly.
 
+`Error checking compiler version for cl`
+
+This warning can appear when MSVC prints localized diagnostics and PyTorch
+cannot decode them with the active Windows code page. The build script sets
+`VSLANG=1033` automatically on Windows. If you still see this warning, set it
+before running pip:
+
+```powershell
+$env:VSLANG = "1033"
+python -m pip install -v --no-build-isolation `
+  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+```
+
 `Put SVDInt4 .safetensors files in ...`
 
 No model files were found in `ComfyUI/models/svdint4`.

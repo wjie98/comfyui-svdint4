@@ -2,12 +2,16 @@ import os
 import platform
 from pathlib import Path
 
-from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
-
 ROOT = Path(__file__).resolve().parent
 IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    # Keep MSVC diagnostics in English so PyTorch's compiler probe can decode
+    # cl.exe output reliably on non-English Windows installations.
+    os.environ.setdefault("VSLANG", "1033")
+
+from setuptools import find_packages, setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 def _arch_list() -> str:

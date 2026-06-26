@@ -47,6 +47,16 @@ heavy `torch/extension.h` and `ATen/cuda/CUDAContext.h` headers so split CUDA
 environments do not need cuSPARSE development headers just to compile the
 Python extension wrapper.
 
+If PyTorch prints `Error checking compiler version for cl`, MSVC is likely
+emitting localized diagnostics that PyTorch cannot decode with the active
+Windows code page. The build script sets `VSLANG=1033` automatically on Windows.
+You can also set it explicitly before installing:
+
+```powershell
+$env:VSLANG = "1033"
+python -m pip install -v --no-build-isolation -e .
+```
+
 ## Check
 
 ```bash
