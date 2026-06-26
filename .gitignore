@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+kernel/build/
+kernel/dist/
+kernel/*.egg-info/
+kernel/svdint4/_C*.so
+kernel/svdint4/_C*.pyd
+kernel/.ninja_deps
+kernel/.ninja_log

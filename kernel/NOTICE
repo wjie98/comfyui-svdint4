@@ -1,0 +1,17 @@
+svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
+W4A4/SVDQuant CUDA kernel path.
+
+Only the INT4 GEMM, activation quantization, and fused SVD LoRA path are
+exposed here. Model wrappers, attention/RoPE/RMSNorm fusion, W8A8, AWQ,
+NVFP4, cache logic, and pipeline integrations are intentionally omitted.
+
+The flattened CUDA kernel subset under csrc/ is derived from Nunchaku:
+
+  https://github.com/nunchaku-ai/nunchaku
+
+Nunchaku is licensed under the Apache License, Version 2.0. A copy of the
+original license text is kept in LICENSES/nunchaku-LICENCE.txt.
+
+The derived subset has been reduced and flattened to the files required for
+INT4 GEMM, activation quantization, and fused SVD LoRA dispatch. The package
+build no longer depends on a sibling nunchaku checkout.

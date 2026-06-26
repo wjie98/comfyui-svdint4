@@ -1,0 +1,3 @@
+# ComfyUI Manager may install this file when the custom node is cloned.
+# Keep it free of svdint4-kernel so CUDA compilation is an explicit user step:
+#   python -m pip install -v --no-build-isolation -e ./kernel

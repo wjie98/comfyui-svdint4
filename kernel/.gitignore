@@ -1,0 +1,12 @@
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.dll
+*.exp
+*.lib
+__pycache__/
+*.pyc
+.ninja_deps
+.ninja_log
