@@ -166,6 +166,11 @@ The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
+Packed SVDInt4 tensors are kept in CPU memory at model-load time and cached on
+the GPU lazily when each Linear is first used. The loader still reports the
+full packed model size to ComfyUI so VRAM planning can unload other models
+before denoising starts.
+
 The node category is:
 
 ```text

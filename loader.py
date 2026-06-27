@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import weakref
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,7 @@ from safetensors import safe_open
 
 import comfy.ops
 import comfy.sd
+from comfy.patcher_extension import CallbacksMP
 
 
 LOG = logging.getLogger("comfyui-svdint4")
@@ -106,6 +108,26 @@ def _packed_tensor_dtype(field: str) -> torch.dtype | None:
     return None
 
 
+def _tensor_nbytes(value: torch.Tensor | None) -> int:
+    if value is None:
+        return 0
+    return value.numel() * value.element_size()
+
+
+class _SVDInt4PackedMover:
+    is_svdint4_packed_mover = True
+
+    def __init__(self, module: "SVDInt4LinearOp"):
+        self._module = weakref.ref(module)
+
+    def move_to(self, device=None) -> int:
+        if device is None or getattr(device, "type", None) == "cpu":
+            module = self._module()
+            if module is not None:
+                return module._release_gpu_tensors()
+        return 0
+
+
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
     packed_layer_names: frozenset[str] = frozenset()
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
@@ -123,6 +145,14 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.bias = None
         self.is_svdint4 = False
         self.compute_dtype = COMPUTE_DTYPE
+        self._svdint4_owner_model = None
+        self._svdint4_cpu_tensors: dict[str, torch.Tensor | None] = {}
+        self._svdint4_gpu_tensors: dict[torch.device, dict[str, torch.Tensor | None]] = {}
+        self._svdint4_gpu_bytes: dict[torch.device, int] = {}
+
+    def _install_release_mover(self) -> None:
+        if not any(getattr(item, "is_svdint4_packed_mover", False) for item in self.weight_function):
+            self.weight_function.append(_SVDInt4PackedMover(self))
 
     def _load_from_state_dict(
         self,
@@ -177,30 +207,67 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.is_svdint4 = True
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = name
-        self.weight = torch.empty((self.out_features, self.in_features), device="meta", dtype=COMPUTE_DTYPE)
-        self.bias = torch.empty((self.out_features,), device="meta", dtype=COMPUTE_DTYPE) if "bias_packed" in tensors else None
-        self.register_buffer("qweight", tensors["qweight"].contiguous())
-        self.register_buffer("wscales", tensors["wscales"].contiguous())
-        self.register_buffer("smooth", tensors.get("smooth"))
-        self.register_buffer("svd_down", tensors["svd_down"].contiguous())
-        self.register_buffer("svd_up", tensors["svd_up"].contiguous())
-        self.register_buffer("bias_packed", tensors.get("bias_packed"))
+        self.has_bias_packed = "bias_packed" in tensors
+        # Keep dense placeholders out of the live module. ComfyUI LoRA/dynamic
+        # loading treats a visible Linear.weight as a full fp16 weight and will
+        # allocate/stage dense patch buffers for it, while this module only uses
+        # the packed SVDInt4 tensors below.
+        self.weight = None
+        self.bias = None
+        self._svdint4_cpu_tensors = {
+            "qweight": tensors["qweight"].contiguous(),
+            "wscales": tensors["wscales"].contiguous(),
+            "smooth": tensors.get("smooth"),
+            "svd_down": tensors["svd_down"].contiguous(),
+            "svd_up": tensors["svd_up"].contiguous(),
+            "bias_packed": tensors.get("bias_packed"),
+        }
+        self._svdint4_gpu_tensors = {}
+        self._svdint4_gpu_bytes = {}
+        self._install_release_mover()
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         if not self.is_svdint4:
             return nn.Module._save_to_state_dict(self, destination, prefix, keep_vars)
         nn.Module._save_to_state_dict(self, destination, prefix, keep_vars)
-        destination[prefix + "weight"] = torch.empty((0,), device="meta", dtype=self.compute_dtype)
-        if self.bias is not None:
-            destination[prefix + "bias"] = torch.empty((0,), device="meta", dtype=self.compute_dtype)
 
-    def _move_buffers_for(self, x: torch.Tensor) -> None:
-        for name, value in self._buffers.items():
+    def _account_gpu_bytes(self, delta: int) -> None:
+        owner = self._svdint4_owner_model() if self._svdint4_owner_model is not None else None
+        if owner is None or not hasattr(owner, "model_loaded_weight_memory"):
+            return
+        owner.model_loaded_weight_memory = max(0, owner.model_loaded_weight_memory + delta)
+
+    def _release_gpu_tensors(self) -> int:
+        released = sum(self._svdint4_gpu_bytes.values())
+        self._svdint4_gpu_tensors.clear()
+        self._svdint4_gpu_bytes.clear()
+        return released
+
+    def _release_gpu_tensors_accounted(self) -> int:
+        released = self._release_gpu_tensors()
+        if released:
+            self._account_gpu_bytes(-released)
+        return released
+
+    def _packed_tensors_for(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        device = x.device
+        cached = self._svdint4_gpu_tensors.get(device)
+        if cached is not None:
+            return cached
+
+        tensors: dict[str, torch.Tensor | None] = {}
+        for name, value in self._svdint4_cpu_tensors.items():
             if value is None:
+                tensors[name] = None
                 continue
             dtype = self.compute_dtype if value.dtype in (torch.float16, torch.bfloat16, torch.float32) else value.dtype
-            if value.device != x.device or value.dtype != dtype:
-                self._buffers[name] = value.to(device=x.device, dtype=dtype, non_blocking=True)
+            tensors[name] = value.to(device=device, dtype=dtype, non_blocking=True)
+
+        moved = sum(_tensor_nbytes(value) for value in tensors.values())
+        self._svdint4_gpu_tensors[device] = tensors
+        self._svdint4_gpu_bytes[device] = moved
+        self._account_gpu_bytes(moved)
+        return tensors
 
     def forward_comfy_cast_weights(self, input):
         if not self.is_svdint4:
@@ -212,15 +279,15 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         svd_int4_linear = _load_svdint4_linear()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
-        self._move_buffers_for(x)
+        tensors = self._packed_tensors_for(x)
         out = svd_int4_linear(
             x,
-            self.qweight,
-            self.wscales,
-            self.svd_down,
-            self.svd_up,
-            smooth_packed=self.smooth,
-            bias_packed=self.bias_packed,
+            tensors["qweight"],
+            tensors["wscales"],
+            tensors["svd_down"],
+            tensors["svd_up"],
+            smooth_packed=tensors["smooth"],
+            bias_packed=tensors["bias_packed"],
             out_features=self.out_features,
         )
         return out if out.dtype == original_dtype else out.to(original_dtype)
@@ -279,9 +346,25 @@ def build_loader_state_dict(
     return state_dict, metadata, packed_layer_tensors
 
 
+def _release_model_gpu_tensors(model_patcher, *_) -> None:
+    released = 0
+    for module in model_patcher.model.modules():
+        if getattr(module, "is_svdint4", False):
+            released += module._release_gpu_tensors_accounted()
+    if released:
+        LOG.info("SVDInt4 released %.2f MB of cached GPU packed tensors", released / (1024 * 1024))
+
+
+def _install_model_release_movers(model_patcher, *_) -> None:
+    for module in model_patcher.model.modules():
+        if getattr(module, "is_svdint4", False):
+            module._install_release_mover()
+
+
 def load_svdint4_model(model_path: str | Path, disable_dynamic: bool = False):
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
+    packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
     try:
         model = comfy.sd.load_diffusion_model_state_dict(
             state_dict,
@@ -298,5 +381,13 @@ def load_svdint4_model(model_path: str | Path, disable_dynamic: bool = False):
             packed_layer_tensors.clear()
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
+    for module in model.model.modules():
+        if getattr(module, "is_svdint4", False):
+            module._svdint4_owner_model = weakref.ref(model.model)
+    base_size = model.model_size()
+    model.size = base_size + packed_bytes
+    model.add_callback(CallbacksMP.ON_LOAD, _install_model_release_movers)
+    model.add_callback(CallbacksMP.ON_DETACH, _release_model_gpu_tensors)
+    model.add_callback(CallbacksMP.ON_CLEANUP, _release_model_gpu_tensors)
     model.cached_patcher_init = (load_svdint4_model, (str(model_path),))
     return model
