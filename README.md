@@ -166,17 +166,20 @@ The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
-Packed SVDInt4 tensors are kept in CPU memory at model-load time and are
-materialized on the GPU only for the current Linear forward by default. The
-loader still reports the full packed model size to ComfyUI so VRAM planning can
-unload other models before denoising starts.
+Packed SVDInt4 tensors are kept in CPU memory at model-load time. By default
+the loader uses `SVDINT4_CACHE_MODE=auto`: it keeps the active high/low branch
+resident on the GPU when there is enough free VRAM, and falls back to streaming
+packed tensors per Linear when there is not enough headroom. The loader reports
+the full packed model size to ComfyUI so VRAM planning can unload other models
+before denoising starts.
 
 For diagnostics, the loader logs the base fp16 bytes, packed SVDInt4 bytes,
 reported model size, resident GPU cache state, and cache release bytes.
 
-`SVDINT4_RESIDENT_GPU_CACHE=1` re-enables the older resident packed-cache mode
-for benchmarking on high-VRAM systems. Leave it unset for normal ComfyUI use,
-especially on Windows or when using DynamicVRAM/offload.
+`SVDINT4_CACHE_MODE=resident` forces resident packed weights for benchmarking on
+high-VRAM systems. `SVDINT4_CACHE_MODE=stream` forces the safest low-VRAM path.
+The older `SVDINT4_RESIDENT_GPU_CACHE=1` variable is still accepted as an alias
+for `resident`.
 
 The node category is:
 
@@ -191,10 +194,14 @@ quantized model and are not user LoRAs. The loader exposes empty meta `.weight`
 keys so ComfyUI can map standard LoRA names without allocating dense base
 weights.
 
-Standard adapter LoRAs are applied as a forward bypass path:
-`svd_int4_linear(x) + lora_up(lora_down(x))`. Dense `diff`/`set` weight patches
-are intentionally not supported for packed SVDInt4 weights. Repack the model
-only when the LoRA is meant to become part of the quantized base.
+`SVDINT4_LORA_BYPASS=auto` is the default. Standard adapter LoRAs can be applied
+as a forward bypass path, but full-coverage LoRA patches that touch most
+SVDInt4 layers are skipped in auto mode because they are usually duplicate
+model-internal SVDQuant adapters from the original workflow. Set
+`SVDINT4_LORA_BYPASS=on` to force an external full-model LoRA, or `off` to skip
+all bypass LoRA. Dense `diff`/`set` weight patches are intentionally not
+supported for packed SVDInt4 weights. Repack the model only when the LoRA is
+meant to become part of the quantized base.
 
 ## Smoke Tests
 
