@@ -166,13 +166,17 @@ The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
-Packed SVDInt4 tensors are kept in CPU memory at model-load time and cached on
-the GPU lazily when each Linear is first used. The loader still reports the
-full packed model size to ComfyUI so VRAM planning can unload other models
-before denoising starts.
+Packed SVDInt4 tensors are kept in CPU memory at model-load time and are
+materialized on the GPU only for the current Linear forward by default. The
+loader still reports the full packed model size to ComfyUI so VRAM planning can
+unload other models before denoising starts.
 
 For diagnostics, the loader logs the base fp16 bytes, packed SVDInt4 bytes,
-reported model size, lazy GPU cache bytes, and cache release bytes.
+reported model size, resident GPU cache state, and cache release bytes.
+
+`SVDINT4_RESIDENT_GPU_CACHE=1` re-enables the older resident packed-cache mode
+for benchmarking on high-VRAM systems. Leave it unset for normal ComfyUI use,
+especially on Windows or when using DynamicVRAM/offload.
 
 The node category is:
 
@@ -183,13 +187,14 @@ SVDInt4/loaders
 ## LoRA
 
 The packed SVDQuant low-rank tensors inside the model are part of the base
-quantized model and are not user LoRAs. The loader intentionally hides dense
-SVDInt4 `.weight` placeholders from ComfyUI's normal LoRA patcher so external
-LoRAs are not fused into quantized base weights by accident.
+quantized model and are not user LoRAs. The loader exposes empty meta `.weight`
+keys so ComfyUI can map standard LoRA names without allocating dense base
+weights.
 
-Extra LoRA should be applied as a separate bypass/adapter path outside the
-packed SVDInt4 base. Repack the model only when the LoRA is meant to become
-part of the quantized base.
+Standard adapter LoRAs are applied as a forward bypass path:
+`svd_int4_linear(x) + lora_up(lora_down(x))`. Dense `diff`/`set` weight patches
+are intentionally not supported for packed SVDInt4 weights. Repack the model
+only when the LoRA is meant to become part of the quantized base.
 
 ## Smoke Tests
 

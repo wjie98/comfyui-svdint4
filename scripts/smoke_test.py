@@ -114,7 +114,9 @@ def run_local_load_forward(comfy_root: Path, model_path: Path, skip_forward: boo
     t3 = time.perf_counter()
     print(
         f"forward ok: {name} input={tuple(x.shape)} output={tuple(y.shape)} "
-        f"dtype={y.dtype} time_ms={(t3 - t2) * 1000:.3f} loaded={patcher.loaded_size() / 1024**2:.2f} MB"
+        f"dtype={y.dtype} time_ms={(t3 - t2) * 1000:.3f} "
+        f"loaded={patcher.loaded_size() / 1024**2:.2f} MB "
+        f"svd_cache={getattr(patcher.model, '_svdint4_cached_gpu_bytes', 0) / 1024**2:.2f} MB"
     )
 
     freed = patcher.partially_unload(patcher.offload_device, memory_to_free=1) or 0
