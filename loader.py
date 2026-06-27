@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import platform
 from pathlib import Path
 
 import torch
@@ -17,6 +18,7 @@ PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_pac
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
 SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
 COMPUTE_DTYPE = torch.float16
+WINDOWS_TURING_CHUNK_M = 256
 
 
 def _kernel_install_hint() -> str:
@@ -43,6 +45,13 @@ def _validate_cuda_kernel_runtime(x: torch.Tensor) -> None:
     sm = major * 10 + minor
     if sm < 75:
         raise RuntimeError(f"SVDInt4 requires NVIDIA Turing/sm75 or newer, got sm{sm}")
+
+
+def _chunk_m_for_device(x: torch.Tensor) -> int:
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if platform.system() == "Windows" and major == 7 and minor == 5:
+        return WINDOWS_TURING_CHUNK_M
+    return 0
 
 
 def _split_packed_key(key: str) -> tuple[str, str] | None:
@@ -214,6 +223,51 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             if value.device != x.device or value.dtype != dtype:
                 self._buffers[name] = value.to(device=x.device, dtype=dtype, non_blocking=True)
 
+    def _svdint4_forward(self, svd_int4_linear, x: torch.Tensor) -> torch.Tensor:
+        chunk_m = _chunk_m_for_device(x)
+        if chunk_m <= 0:
+            return svd_int4_linear(
+                x,
+                self.qweight,
+                self.wscales,
+                self.svd_down,
+                self.svd_up,
+                smooth_packed=self.smooth,
+                bias_packed=self.bias_packed,
+                out_features=self.out_features,
+            )
+
+        original_shape = x.shape[:-1]
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if x2d.shape[0] <= chunk_m:
+            return svd_int4_linear(
+                x2d,
+                self.qweight,
+                self.wscales,
+                self.svd_down,
+                self.svd_up,
+                smooth_packed=self.smooth,
+                bias_packed=self.bias_packed,
+                out_features=self.out_features,
+            ).reshape(*original_shape, self.out_features)
+
+        chunks = []
+        for start in range(0, x2d.shape[0], chunk_m):
+            chunk = x2d[start : start + chunk_m]
+            chunks.append(
+                svd_int4_linear(
+                    chunk,
+                    self.qweight,
+                    self.wscales,
+                    self.svd_down,
+                    self.svd_up,
+                    smooth_packed=self.smooth,
+                    bias_packed=self.bias_packed,
+                    out_features=self.out_features,
+                )
+            )
+        return torch.cat(chunks, dim=0).reshape(*original_shape, self.out_features)
+
     def forward_comfy_cast_weights(self, input):
         if not self.is_svdint4:
             return super().forward_comfy_cast_weights(input)
@@ -225,16 +279,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
         self._move_buffers_for(x)
-        out = svd_int4_linear(
-            x,
-            self.qweight,
-            self.wscales,
-            self.svd_down,
-            self.svd_up,
-            smooth_packed=self.smooth,
-            bias_packed=self.bias_packed,
-            out_features=self.out_features,
-        )
+        out = self._svdint4_forward(svd_int4_linear, x)
         return out if out.dtype == original_dtype else out.to(original_dtype)
 
 

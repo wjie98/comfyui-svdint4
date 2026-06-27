@@ -199,7 +199,9 @@ For source builds, also make sure `--no-build-isolation` is present.
 Windows runtime
 
 The loader uses FP16 by default on every supported GPU, including Ampere and
-newer cards. SVDInt4 requires Turing/sm75 or newer.
+newer cards. SVDInt4 requires Turing/sm75 or newer. On Windows Turing GPUs, the
+loader runs each Linear in small M-dimension chunks to avoid long custom CUDA
+kernel launches that can trigger Windows driver resets.
 
 `fatal error C1083: ... cusparse.h: No such file or directory`
 
