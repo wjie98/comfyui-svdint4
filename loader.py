@@ -59,14 +59,12 @@ def is_svdint4_file(model_path: str | Path) -> bool:
         return False
 
 
-def _warn_if_unknown_format(metadata: dict[str, str], model_path: Path) -> None:
+def _validate_metadata(metadata: dict[str, str], model_path: Path) -> None:
     fmt = metadata.get("format")
     if fmt not in SUPPORTED_FORMATS:
-        LOG.warning(
-            "SVDInt4 model %s has format=%r; expected one of %s",
-            model_path,
-            fmt,
-            sorted(SUPPORTED_FORMATS),
+        raise ValueError(
+            f"{model_path} is not an SVDInt4 DiT file: format={fmt!r}; "
+            f"expected one of {sorted(SUPPORTED_FORMATS)}"
         )
 
 
@@ -253,8 +251,10 @@ class SVDInt4Ops(comfy.ops.manual_cast):
 def build_loader_state_dict(model_path: str | Path) -> tuple[dict[str, torch.Tensor], dict[str, str], set[str]]:
     model_path = Path(model_path)
     metadata = _model_metadata(model_path)
-    _warn_if_unknown_format(metadata, model_path)
+    _validate_metadata(metadata, model_path)
     packed_layers = _collect_packed_layers(model_path)
+    if not packed_layers:
+        raise ValueError(f"{model_path} does not contain any complete SVDInt4 Linear layers")
     state_dict: dict[str, torch.Tensor] = {}
 
     with safe_open(model_path, framework="pt", device="cpu") as handle:

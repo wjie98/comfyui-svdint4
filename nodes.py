@@ -4,57 +4,92 @@ import os
 from pathlib import Path
 
 import folder_paths
+from safetensors import safe_open
 
-from .loader import is_svdint4_file, load_svdint4_model
 
-
-FOLDER_NAME = "svdint4"
+FOLDER_NAME = "diffusion_models"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
+ENV_PATHS = ("SVDINT4_DIT_PATHS", "SVDINT4_MODEL_PATHS")
+SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
 
 
-def _register_model_dirs() -> None:
-    roots = [str(Path(folder_paths.models_dir) / "svdint4")]
-    env_roots = os.environ.get("SVDINT4_MODEL_PATHS", "")
-    roots.extend([item for item in env_roots.split(os.pathsep) if item])
-    folder_paths.folder_names_and_paths[FOLDER_NAME] = (roots, MODEL_EXTENSIONS)
+def _model_dirs() -> list[str]:
+    return folder_paths.get_folder_paths(FOLDER_NAME)
+
+
+def _register_extra_model_dirs() -> None:
+    changed = False
+    for env_name in ENV_PATHS:
+        for item in os.environ.get(env_name, "").split(os.pathsep):
+            if not item:
+                continue
+            before = _model_dirs()
+            folder_paths.add_model_folder_path(FOLDER_NAME, item)
+            changed = changed or before != _model_dirs()
+    if changed:
+        folder_paths.filename_list_cache.pop(FOLDER_NAME, None)
 
 
 def _model_names() -> list[str]:
-    _register_model_dirs()
+    _register_extra_model_dirs()
     names: list[str] = []
     for name in folder_paths.get_filename_list(FOLDER_NAME):
+        if Path(name).suffix.lower() not in MODEL_EXTENSIONS:
+            continue
         path = folder_paths.get_full_path(FOLDER_NAME, name)
-        if path is not None and is_svdint4_file(path):
+        if path is not None and _is_svdint4_file(path):
             names.append(name)
-    return names or ["manual"]
+    return names
+
+
+def _is_svdint4_file(model_path: str | Path) -> bool:
+    try:
+        with safe_open(model_path, framework="pt", device="cpu") as handle:
+            return (handle.metadata() or {}).get("format") in SUPPORTED_FORMATS
+    except Exception:
+        return False
 
 
 def _resolve_model_path(model_name: str) -> str:
-    _register_model_dirs()
-    if model_name == "manual":
-        raise ValueError(f"Put SVDInt4 .safetensors files in {Path(folder_paths.models_dir) / 'svdint4'}")
+    _register_extra_model_dirs()
     return folder_paths.get_full_path_or_raise(FOLDER_NAME, model_name)
 
 
-class SVDInt4ModelLoader:
+class SVDInt4DiffusionModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"model_name": (_model_names(),)}}
+        return {
+            "required": {
+                "unet_name": (
+                    _model_names(),
+                    {
+                        "tooltip": (
+                            "SVDInt4 DiT file from ComfyUI/models/diffusion_models. "
+                            "Only svdint4-dit-safetensors-v1 files are shown."
+                        )
+                    },
+                )
+            }
+        }
 
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
-    FUNCTION = "load_model"
-    CATEGORY = "svdint4"
-    TITLE = "SVDInt4 Model Loader"
+    FUNCTION = "load_diffusion_model"
+    CATEGORY = "model/loaders"
+    TITLE = "Load SVDInt4 Diffusion Model"
 
-    def load_model(self, model_name: str):
-        return (load_svdint4_model(_resolve_model_path(model_name)),)
+    def load_diffusion_model(self, unet_name: str):
+        from .loader import load_svdint4_model
+
+        return (load_svdint4_model(_resolve_model_path(unet_name)),)
 
 
 NODE_CLASS_MAPPINGS = {
-    "SVDInt4ModelLoader": SVDInt4ModelLoader,
+    "SVDInt4DiffusionModelLoader": SVDInt4DiffusionModelLoader,
+    "SVDInt4ModelLoader": SVDInt4DiffusionModelLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SVDInt4ModelLoader": "SVDInt4 Model Loader",
+    "SVDInt4DiffusionModelLoader": "Load SVDInt4 Diffusion Model",
+    "SVDInt4ModelLoader": "Load SVDInt4 Diffusion Model",
 }

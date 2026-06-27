@@ -85,10 +85,10 @@ imported as `svdint4`.
 
 ## Model Files
 
-Place SVDInt4 model files under:
+Place SVDInt4 DiT model files under ComfyUI's normal diffusion model folder:
 
 ```text
-ComfyUI/models/svdint4/<model-name>.safetensors
+ComfyUI/models/diffusion_models/<model-name>.safetensors
 ```
 
 Each `.safetensors` file contains one DiT branch. Wan2.2/Bernini workflows that
@@ -112,8 +112,12 @@ tensors:
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
 
-For custom model locations, set `SVDINT4_MODEL_PATHS` before starting ComfyUI.
-Separate multiple paths with `:` on Linux/macOS or `;` on Windows.
+The node scans the existing `diffusion_models` paths, including legacy
+`models/unet`, and only shows files whose metadata has
+`format=svdint4-dit-safetensors-v1`. For custom model locations, set
+`SVDINT4_DIT_PATHS` before starting ComfyUI. Separate multiple paths with `:` on
+Linux/macOS or `;` on Windows. `SVDINT4_MODEL_PATHS` is still accepted for
+backward compatibility.
 
 ## Converting Shard Packs
 
@@ -153,8 +157,9 @@ bernini-low.safetensors
 
 ## Nodes
 
-- `SVDInt4 Model Loader`
-  Selects one `.safetensors` model file and returns a ComfyUI `MODEL`.
+- `Load SVDInt4 Diffusion Model`
+  Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
+  returns a ComfyUI `MODEL`.
 
 The loader infers the kernel compute dtype from the packed tensors. There is no
 separate model dtype setting.
@@ -204,9 +209,11 @@ python -m pip install -v --no-build-isolation `
   "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
 ```
 
-`Put SVDInt4 .safetensors files in ...`
+The model dropdown is empty
 
-No model files were found in `ComfyUI/models/svdint4`.
+No valid SVDInt4 DiT files were found. Put the single-file assets in
+`ComfyUI/models/diffusion_models` and make sure their metadata contains
+`format=svdint4-dit-safetensors-v1`.
 
 ComfyUI starts, but generation fails when sampling
 
