@@ -94,29 +94,9 @@ def _collect_packed_layers_from_handle(handle) -> dict[str, dict[str, tuple[str,
     return valid
 
 
-def _collect_packed_layers(model_path: Path) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
-    with safe_open(model_path, framework="pt", device="cpu") as handle:
-        return _collect_packed_layers_from_handle(handle)
-
-
-def _load_layer_tensors(model_path: Path, name: str) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    with safe_open(model_path, framework="pt", device="cpu") as handle:
-        keys = set(handle.keys())
-        for field in PACKED_FIELDS:
-            key = f"{name}.{field}"
-            if key in keys:
-                tensors[field] = _owned_cpu_tensor(handle.get_tensor(key), _packed_tensor_dtype(field))
-
-    missing = REQUIRED_FIELDS - tensors.keys()
-    if missing:
-        raise KeyError(f"{name} missing required SVDInt4 tensors: {sorted(missing)}")
-    return tensors
-
-
 def _owned_cpu_tensor(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
     if dtype is not None and value.dtype != dtype:
-        value = value.to(dtype)
+        return value.to(dtype).contiguous()
     return value.contiguous().clone()
 
 
@@ -127,7 +107,6 @@ def _packed_tensor_dtype(field: str) -> torch.dtype | None:
 
 
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
-    model_path: Path | None = None
     packed_layer_names: frozenset[str] = frozenset()
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -192,11 +171,9 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             missing_keys.append(prefix + "bias")
 
     def _load_svdint4(self, name: str) -> None:
-        if self.model_path is None:
-            raise RuntimeError("SVDInt4 Linear missing model_path")
         tensors = self.packed_layer_tensors.pop(name, None)
         if tensors is None:
-            tensors = _load_layer_tensors(self.model_path, name)
+            raise RuntimeError(f"SVDInt4 packed tensors for {name} were not preloaded")
         self.is_svdint4 = True
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = name
@@ -250,12 +227,11 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
 
 
 class SVDInt4Ops(comfy.ops.manual_cast):
-    def __init__(self, model_path: str | Path, packed_layer_tensors: dict[str, dict[str, torch.Tensor]]):
+    def __init__(self, packed_layer_tensors: dict[str, dict[str, torch.Tensor]]):
         self.Linear = type(
             "Linear",
             (SVDInt4LinearOp,),
             {
-                "model_path": Path(model_path),
                 "packed_layer_names": frozenset(packed_layer_tensors),
                 "packed_layer_tensors": packed_layer_tensors,
             },
@@ -306,18 +282,20 @@ def build_loader_state_dict(
 def load_svdint4_model(model_path: str | Path, disable_dynamic: bool = False):
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
-    model = comfy.sd.load_diffusion_model_state_dict(
-        state_dict,
-        model_options={"custom_operations": SVDInt4Ops(model_path, packed_layer_tensors)},
-        metadata=metadata,
-        disable_dynamic=disable_dynamic,
-    )
-    if packed_layer_tensors:
-        LOG.warning(
-            "SVDInt4 model load left %d packed Linear layers unused; clearing them to release CPU memory",
-            len(packed_layer_tensors),
+    try:
+        model = comfy.sd.load_diffusion_model_state_dict(
+            state_dict,
+            model_options={"custom_operations": SVDInt4Ops(packed_layer_tensors)},
+            metadata=metadata,
+            disable_dynamic=disable_dynamic,
         )
-        packed_layer_tensors.clear()
+    finally:
+        if packed_layer_tensors:
+            LOG.warning(
+                "SVDInt4 model load left %d packed Linear layers unused; clearing them to release CPU memory",
+                len(packed_layer_tensors),
+            )
+            packed_layer_tensors.clear()
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.cached_patcher_init = (load_svdint4_model, (str(model_path),))
