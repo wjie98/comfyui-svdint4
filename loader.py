@@ -151,6 +151,20 @@ def _adapter_weights_to(value, device: torch.device, dtype: torch.dtype):
     return value
 
 
+def _adapter_weights_nbytes(value) -> int:
+    if isinstance(value, torch.Tensor):
+        return _tensor_nbytes(value)
+    if isinstance(value, tuple):
+        return sum(_adapter_weights_nbytes(item) for item in value)
+    if isinstance(value, list):
+        return sum(_adapter_weights_nbytes(item) for item in value)
+    return 0
+
+
+def _adapter_to_device(adapter: comfy.weight_adapter.WeightAdapterBase, device: torch.device, dtype: torch.dtype):
+    return type(adapter)(adapter.loaded_keys, _adapter_weights_to(adapter.weights, device, dtype))
+
+
 @dataclasses.dataclass
 class SVDInt4PackedParams:
     wscales: torch.Tensor
@@ -514,7 +528,6 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 )
                 continue
 
-            old_weights = patch_data.weights
             old_attrs = {
                 "multiplier": getattr(patch_data, "multiplier", None),
                 "is_conv": getattr(patch_data, "is_conv", None),
@@ -525,7 +538,6 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 "out_channels": getattr(patch_data, "out_channels", None),
             }
             try:
-                patch_data.weights = _adapter_weights_to(old_weights, x.device, x.dtype)
                 patch_data.multiplier = strength_patch
                 patch_data.is_conv = False
                 patch_data.conv_dim = 0
@@ -545,7 +557,6 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                     exc,
                 )
             finally:
-                patch_data.weights = old_weights
                 for attr, value in old_attrs.items():
                     setattr(patch_data, attr, value)
         return result
@@ -730,13 +741,23 @@ def _install_svdint4_lora_key_map() -> None:
 def _attach_lora_adapter_overlays(model_patcher) -> None:
     enable_lora_adapters = bool(getattr(model_patcher.model, "_svdint4_enable_lora_adapters", False))
     adapter_count = 0
+    adapter_bytes = 0
     pending_overlays = getattr(model_patcher.model, "_svdint4_pending_adapter_lora_overlays", {}) or {}
     for name, module in model_patcher.model.named_modules():
         if not getattr(module, "is_svdint4", False):
             continue
 
         overlays = pending_overlays.get(f"{name}.weight", [])
-        module._svdint4_adapter_lora_overlays = overlays if enable_lora_adapters else []
+        if enable_lora_adapters and overlays:
+            prepared_overlays = []
+            for strength_patch, patch_data, strength_model, offset, function in overlays:
+                if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+                    patch_data = _adapter_to_device(patch_data, module.weight.device, module.compute_dtype)
+                    adapter_bytes += _adapter_weights_nbytes(patch_data.weights)
+                prepared_overlays.append((strength_patch, patch_data, strength_model, offset, function))
+            module._svdint4_adapter_lora_overlays = prepared_overlays
+        else:
+            module._svdint4_adapter_lora_overlays = []
         adapter_count += len(overlays)
 
     if not enable_lora_adapters:
@@ -749,7 +770,13 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
         return
 
     if adapter_count:
-        LOG.info("SVDInt4 attached %d adapter LoRA overlay patch(es)", adapter_count)
+        LOG.warning(
+            "SVDInt4 attached %d adapter LoRA overlay patch(es), %.2f MB resident. "
+            "Adapter overlays are separate fp16 matmul paths and are not fused into the SVDInt4 kernel; "
+            "disable enable_lora_adapters unless you intentionally need an external LoRA.",
+            adapter_count,
+            _mb(adapter_bytes),
+        )
     skipped_count = int(getattr(model_patcher.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
     if skipped_count:
         LOG.warning(
