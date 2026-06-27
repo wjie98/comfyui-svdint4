@@ -1,5 +1,4 @@
 #include <ATen/ATen.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -13,7 +12,7 @@ namespace {
 
 class TorchOpContext {
 public:
-    explicit TorchOpContext(const at::Tensor &device_tensor) : deviceGuard_(device_tensor.get_device()) {
+    TorchOpContext() {
         stackCUDAStreams.push_back(at::cuda::getCurrentCUDAStream().stream());
     }
 
@@ -25,12 +24,7 @@ public:
         assert(stackCUDAStreams.back() == at::cuda::getCurrentCUDAStream().stream());
         stackCUDAStreams.pop_back();
     }
-
-private:
-    c10::cuda::CUDAGuard deviceGuard_;
 };
-
-constexpr int64_t kMaxLoraRank = 1024;
 
 int64_t ceil_div(int64_t x, int64_t y) {
     return (x + y - 1) / y;
@@ -98,19 +92,6 @@ void check_cuda_2d(const at::Tensor &t, const char *name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
-void check_same_cuda_device(const at::Tensor &reference, const at::Tensor &t, const char *reference_name, const char *name) {
-    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
-    TORCH_CHECK(t.get_device() == reference.get_device(),
-                name,
-                " must be on the same CUDA device as ",
-                reference_name,
-                " (got cuda:",
-                t.get_device(),
-                ", expected cuda:",
-                reference.get_device(),
-                ")");
-}
-
 void check_half_like(const at::Tensor &t, const char *name) {
     TORCH_CHECK(t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16,
                 name,
@@ -146,8 +127,6 @@ quantize_act_lora(at::Tensor input, at::Tensor lora_down, at::Tensor smooth, int
     check_cuda_2d(lora_down, "lora_down");
     TORCH_CHECK(smooth.is_cuda(), "smooth must be a CUDA tensor");
     TORCH_CHECK(smooth.is_contiguous(), "smooth must be contiguous");
-    check_same_cuda_device(input, lora_down, "input", "lora_down");
-    check_same_cuda_device(input, smooth, "input", "smooth");
     check_half_like(input, "input");
     TORCH_CHECK(lora_down.scalar_type() == input.scalar_type(), "lora_down dtype must match input dtype");
     TORCH_CHECK(smooth.scalar_type() == input.scalar_type(), "smooth dtype must match input dtype");
@@ -160,7 +139,6 @@ quantize_act_lora(at::Tensor input, at::Tensor lora_down, at::Tensor smooth, int
 
     TORCH_CHECK(lora_down.size(0) == k_pad,
                 "lora_down first dimension must equal ceil(input K / 128) * 128");
-    TORCH_CHECK(rank > 0 && rank <= kMaxLoraRank, "lora rank must be in the range [1, 1024]");
     TORCH_CHECK(rank % 16 == 0, "lora rank must be a multiple of 16");
     TORCH_CHECK(smooth.numel() == k_pad, "smooth must be packed per-channel scale with k_pad elements");
 
@@ -171,7 +149,7 @@ quantize_act_lora(at::Tensor input, at::Tensor lora_down, at::Tensor smooth, int
     at::Tensor ascales = at::empty({k_pad / 64, m_pad}, scale_opts);
     at::Tensor lora_act = at::empty({m_pad, rank}, f32_opts);
 
-    TorchOpContext ctx(input);
+    TorchOpContext ctx;
     svdint4::kernels::quantize_act_lora(from_torch(input),
                                          from_torch(qact),
                                          from_torch(ascales),
@@ -208,11 +186,6 @@ at::Tensor gemm_svd(at::Tensor act,
     check_cuda_2d(wscales, "wscales");
     check_cuda_2d(lora_act, "lora_act");
     check_cuda_2d(lora_up, "lora_up");
-    check_same_cuda_device(act, qweight, "act", "qweight");
-    check_same_cuda_device(act, ascales, "act", "ascales");
-    check_same_cuda_device(act, wscales, "act", "wscales");
-    check_same_cuda_device(act, lora_act, "act", "lora_act");
-    check_same_cuda_device(act, lora_up, "act", "lora_up");
     TORCH_CHECK(act.scalar_type() == at::kByte || act.scalar_type() == at::kChar, "act must be int8/uint8 packed");
     TORCH_CHECK(qweight.scalar_type() == at::kByte || qweight.scalar_type() == at::kChar,
                 "qweight must be int8/uint8 packed");
@@ -235,7 +208,6 @@ at::Tensor gemm_svd(at::Tensor act,
     TORCH_CHECK(lora_act.size(0) == m_pad, "lora_act M must match act M");
     TORCH_CHECK(lora_act.size(1) == rank, "lora_act rank must match lora_up rank");
     TORCH_CHECK(lora_up.size(0) == n_pad, "lora_up N must match qweight N");
-    TORCH_CHECK(rank > 0 && rank <= kMaxLoraRank, "lora rank must be in the range [1, 1024]");
     TORCH_CHECK(rank % 16 == 0, "lora rank must be a multiple of 16");
 
     if (actual_m < 0) {
@@ -252,7 +224,6 @@ at::Tensor gemm_svd(at::Tensor act,
     if (bias.has_value()) {
         TORCH_CHECK(bias.value().is_cuda(), "bias must be CUDA");
         TORCH_CHECK(bias.value().is_contiguous(), "bias must be contiguous");
-        check_same_cuda_device(act, bias.value(), "act", "bias");
         TORCH_CHECK(bias.value().scalar_type() == ascales.scalar_type(), "bias dtype must match ascales dtype");
         TORCH_CHECK(bias.value().numel() == n_pad, "bias must be packed/padded to qweight N");
     }
@@ -260,7 +231,7 @@ at::Tensor gemm_svd(at::Tensor act,
     at::Tensor out = at::empty({actual_m, actual_n}, ascales.options());
     lora_scales = normalize_lora_scales(std::move(lora_scales), rank);
 
-    TorchOpContext ctx(act);
+    TorchOpContext ctx;
     svdint4::kernels::gemm_svd(from_torch(act),
                                 from_torch(qweight),
                                 from_torch(out),
