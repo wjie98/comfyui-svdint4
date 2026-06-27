@@ -202,6 +202,165 @@ def _adapter_weights_to(value, device: torch.device, dtype: torch.dtype):
     return value
 
 
+class SVDInt4PackedTensor:
+    """Packed SVDInt4 weight storage for one logical Linear weight.
+
+    ComfyUI's dynamic loader treats a non-None module.weight as a dense tensor
+    unless it is one of its registered QuantizedTensor layouts. Keep this object
+    as the internal packed storage for now, and expose only a zero-sized state
+    view for key discovery/accounting.
+    """
+
+    is_svdint4_packed_tensor = True
+
+    def __init__(
+        self,
+        name: str,
+        in_features: int,
+        out_features: int,
+        tensors: dict[str, torch.Tensor],
+        compute_dtype: torch.dtype,
+    ):
+        self.name = name
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.shape = torch.Size((self.out_features, self.in_features))
+        self.dtype = compute_dtype
+        self.device = torch.device("cpu")
+        self.requires_grad = False
+        self.has_bias_packed = "bias_packed" in tensors
+        self._owner_model = None
+        self._cpu_tensors: dict[str, torch.Tensor | None] = {
+            "qweight": tensors["qweight"].contiguous(),
+            "wscales": tensors["wscales"].contiguous(),
+            "smooth": tensors.get("smooth"),
+            "svd_down": tensors["svd_down"].contiguous(),
+            "svd_up": tensors["svd_up"].contiguous(),
+            "bias_packed": tensors.get("bias_packed"),
+        }
+        self._gpu_tensors: dict[torch.device, dict[str, torch.Tensor | None]] = {}
+        self._gpu_bytes: dict[torch.device, int] = {}
+        self._cache_lock = threading.RLock()
+        self.packed_nbytes = sum(_tensor_nbytes(value) for value in self._cpu_tensors.values())
+
+    @property
+    def nbytes(self) -> int:
+        return self.packed_nbytes
+
+    def numel(self) -> int:
+        return self.out_features * self.in_features
+
+    def element_size(self) -> int:
+        return torch.tensor([], dtype=self.dtype).element_size()
+
+    def set_owner_model(self, owner_model) -> None:
+        self._owner_model = owner_model
+
+    def state_dict_tensor(self) -> torch.Tensor:
+        return torch.empty((0,), device="meta", dtype=self.dtype)
+
+    def to(self, *args, **kwargs) -> "SVDInt4PackedTensor":
+        device = kwargs.get("device")
+        if device is None:
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    device = arg.device
+                    break
+                if isinstance(arg, (torch.device, str, int)):
+                    device = arg
+                    break
+        target = torch.device(device) if device is not None else None
+        self.move_to(target)
+        return self
+
+    def move_to(self, device=None, account_loaded: bool = False) -> int:
+        if getattr(device, "type", None) == "cuda" and self.use_resident_cache(device):
+            return self.cache_tensors_on(device, account_loaded=account_loaded)
+        if device is None or getattr(device, "type", None) == "cpu":
+            return self.release_gpu_tensors(account_loaded=account_loaded)
+        return 0
+
+    def owner_model(self):
+        return self._owner_model() if self._owner_model is not None else None
+
+    def use_resident_cache(self, device: torch.device) -> bool:
+        owner = self.owner_model()
+        if owner is None:
+            return False
+        mode = _select_cache_policy(owner, device)
+        return mode == "resident" and device.type == "cuda"
+
+    def account_gpu_bytes(self, delta: int, account_loaded: bool) -> None:
+        owner = self.owner_model()
+        if owner is None:
+            return
+        owner._svdint4_cached_gpu_bytes = max(0, getattr(owner, "_svdint4_cached_gpu_bytes", 0) + delta)
+        if account_loaded and hasattr(owner, "model_loaded_weight_memory"):
+            owner.model_loaded_weight_memory = max(0, owner.model_loaded_weight_memory + delta)
+
+    def release_gpu_tensors(self, account_loaded: bool) -> int:
+        with self._cache_lock:
+            released = sum(self._gpu_bytes.values())
+            self._gpu_tensors.clear()
+            self._gpu_bytes.clear()
+        if released:
+            self.account_gpu_bytes(-released, account_loaded=account_loaded)
+        return released
+
+    def copy_tensors_to(self, device: torch.device) -> dict[str, torch.Tensor | None]:
+        tensors: dict[str, torch.Tensor | None] = {}
+        for name, value in self._cpu_tensors.items():
+            if value is None:
+                tensors[name] = None
+                continue
+            dtype = self.dtype if value.dtype in (torch.float16, torch.bfloat16, torch.float32) else value.dtype
+            tensors[name] = value.to(device=device, dtype=dtype, non_blocking=True)
+        return tensors
+
+    def cache_tensors_on(self, device: torch.device, account_loaded: bool) -> int:
+        cached = self._gpu_tensors.get(device)
+        if cached is not None:
+            return 0
+
+        with self._cache_lock:
+            cached = self._gpu_tensors.get(device)
+            if cached is not None:
+                return 0
+
+            try:
+                tensors = self.copy_tensors_to(device)
+            except torch.OutOfMemoryError:
+                released = 0
+                owner = self.owner_model()
+                if owner is not None:
+                    owner._svdint4_effective_cache_mode = "stream"
+                    released = _release_root_gpu_tensors(owner, account_loaded=account_loaded)
+                LOG.warning(
+                    "SVDInt4 resident cache ran out of VRAM while loading %s; falling back to stream mode",
+                    self.name,
+                )
+                return -released if not account_loaded else 0
+
+            moved = sum(_tensor_nbytes(value) for value in tensors.values())
+            self._gpu_tensors[device] = tensors
+            self._gpu_bytes[device] = moved
+
+        self.account_gpu_bytes(moved, account_loaded=account_loaded)
+        LOG.debug("SVDInt4 cached %.2f MB for %s on %s", _mb(moved), self.name, device)
+        return moved
+
+    def tensors_for(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        device = x.device
+        if not self.use_resident_cache(device):
+            return self.copy_tensors_to(device)
+
+        self.cache_tensors_on(device, account_loaded=True)
+        cached = self._gpu_tensors.get(device)
+        if cached is None:
+            return self.copy_tensors_to(device)
+        return cached
+
+
 class _SVDInt4PackedMover:
     is_svdint4_packed_mover = True
 
@@ -209,14 +368,9 @@ class _SVDInt4PackedMover:
         self._module = weakref.ref(module)
 
     def move_to(self, device=None) -> int:
-        if getattr(device, "type", None) == "cuda":
-            module = self._module()
-            if module is not None and module._use_resident_cache(device):
-                return module._cache_tensors_on(device, account_loaded=False)
-        if device is None or getattr(device, "type", None) == "cpu":
-            module = self._module()
-            if module is not None:
-                return module._release_gpu_tensors(account_loaded=False)
+        module = self._module()
+        if module is not None and module.packed_weight is not None:
+            return module.packed_weight.move_to(device, account_loaded=False)
         return 0
 
 
@@ -238,10 +392,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.is_svdint4 = False
         self.compute_dtype = COMPUTE_DTYPE
         self._svdint4_owner_model = None
-        self._svdint4_cpu_tensors: dict[str, torch.Tensor | None] = {}
-        self._svdint4_gpu_tensors: dict[torch.device, dict[str, torch.Tensor | None]] = {}
-        self._svdint4_gpu_bytes: dict[torch.device, int] = {}
-        self._svdint4_cache_lock = threading.RLock()
+        self.packed_name = None
+        self.packed_weight: SVDInt4PackedTensor | None = None
         self._svdint4_lora_patches = []
         self._svdint4_lora_warnings: set[str] = set()
 
@@ -305,106 +457,32 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         # the packed SVDInt4 tensors below.
         self.weight = None
         self.bias = None
-        self._svdint4_cpu_tensors = {
-            "qweight": tensors["qweight"].contiguous(),
-            "wscales": tensors["wscales"].contiguous(),
-            "smooth": tensors.get("smooth"),
-            "svd_down": tensors["svd_down"].contiguous(),
-            "svd_up": tensors["svd_up"].contiguous(),
-            "bias_packed": tensors.get("bias_packed"),
-        }
-        self._svdint4_gpu_tensors = {}
-        self._svdint4_gpu_bytes = {}
+        self.packed_weight = SVDInt4PackedTensor(
+            name=name,
+            in_features=self.in_features,
+            out_features=self.out_features,
+            tensors=tensors,
+            compute_dtype=self.compute_dtype,
+        )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         if not self.is_svdint4:
             return nn.Module._save_to_state_dict(self, destination, prefix, keep_vars)
-        destination[prefix + "weight"] = torch.empty((0,), device="meta", dtype=self.compute_dtype)
-        if self.has_bias_packed:
-            destination[prefix + "bias"] = torch.empty((0,), device="meta", dtype=self.compute_dtype)
-
-    def _account_gpu_bytes(self, delta: int, account_loaded: bool) -> None:
-        owner = self._svdint4_owner_model() if self._svdint4_owner_model is not None else None
-        if owner is None:
+        if self.packed_weight is None:
             return
-        owner._svdint4_cached_gpu_bytes = max(0, getattr(owner, "_svdint4_cached_gpu_bytes", 0) + delta)
-        if account_loaded and hasattr(owner, "model_loaded_weight_memory"):
-            owner.model_loaded_weight_memory = max(0, owner.model_loaded_weight_memory + delta)
+        destination[prefix + "weight"] = self.packed_weight.state_dict_tensor()
+        if self.has_bias_packed:
+            destination[prefix + "bias"] = self.packed_weight.state_dict_tensor()
 
     def _release_gpu_tensors(self, account_loaded: bool) -> int:
-        with self._svdint4_cache_lock:
-            released = sum(self._svdint4_gpu_bytes.values())
-            self._svdint4_gpu_tensors.clear()
-            self._svdint4_gpu_bytes.clear()
-        if released:
-            self._account_gpu_bytes(-released, account_loaded=account_loaded)
-        return released
-
-    def _release_gpu_tensors_accounted(self) -> int:
-        return self._release_gpu_tensors(account_loaded=True)
-
-    def _copy_tensors_to(self, device: torch.device) -> dict[str, torch.Tensor | None]:
-        tensors: dict[str, torch.Tensor | None] = {}
-        for name, value in self._svdint4_cpu_tensors.items():
-            if value is None:
-                tensors[name] = None
-                continue
-            dtype = self.compute_dtype if value.dtype in (torch.float16, torch.bfloat16, torch.float32) else value.dtype
-            tensors[name] = value.to(device=device, dtype=dtype, non_blocking=True)
-        return tensors
-
-    def _owner_model(self):
-        return self._svdint4_owner_model() if self._svdint4_owner_model is not None else None
-
-    def _use_resident_cache(self, device: torch.device) -> bool:
-        owner = self._owner_model()
-        if owner is None:
-            return False
-        mode = _select_cache_policy(owner, device)
-        return mode == "resident" and device.type == "cuda"
-
-    def _cache_tensors_on(self, device: torch.device, account_loaded: bool) -> int:
-        cached = self._svdint4_gpu_tensors.get(device)
-        if cached is not None:
+        if self.packed_weight is None:
             return 0
-
-        with self._svdint4_cache_lock:
-            cached = self._svdint4_gpu_tensors.get(device)
-            if cached is not None:
-                return 0
-
-            try:
-                tensors = self._copy_tensors_to(device)
-            except torch.OutOfMemoryError:
-                released = 0
-                owner = self._owner_model()
-                if owner is not None:
-                    owner._svdint4_effective_cache_mode = "stream"
-                    released = _release_root_gpu_tensors(owner, account_loaded=account_loaded)
-                LOG.warning(
-                    "SVDInt4 resident cache ran out of VRAM while loading %s; falling back to stream mode",
-                    getattr(self, "packed_name", "<unknown>"),
-                )
-                return -released if not account_loaded else 0
-
-            moved = sum(_tensor_nbytes(value) for value in tensors.values())
-            self._svdint4_gpu_tensors[device] = tensors
-            self._svdint4_gpu_bytes[device] = moved
-
-        self._account_gpu_bytes(moved, account_loaded=account_loaded)
-        LOG.debug("SVDInt4 cached %.2f MB for %s on %s", _mb(moved), getattr(self, "packed_name", "<unknown>"), device)
-        return moved
+        return self.packed_weight.release_gpu_tensors(account_loaded=account_loaded)
 
     def _packed_tensors_for(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
-        device = x.device
-        if not self._use_resident_cache(device):
-            return self._copy_tensors_to(device)
-
-        self._cache_tensors_on(device, account_loaded=True)
-        cached = self._svdint4_gpu_tensors.get(device)
-        if cached is None:
-            return self._copy_tensors_to(device)
-        return cached
+        if self.packed_weight is None:
+            raise RuntimeError("SVDInt4 packed weight is not loaded")
+        return self.packed_weight.tensors_for(x)
 
     def _warn_lora_once(self, code: str, message: str, *args) -> None:
         if code in self._svdint4_lora_warnings:
@@ -744,7 +822,10 @@ def load_svdint4_model(
     _ACTIVE_MODEL_ROOTS.add(model.model)
     for name, module in model.model.named_modules():
         if getattr(module, "is_svdint4", False):
-            module._svdint4_owner_model = weakref.ref(model.model)
+            owner_ref = weakref.ref(model.model)
+            module._svdint4_owner_model = owner_ref
+            if module.packed_weight is not None:
+                module.packed_weight.set_owner_model(owner_ref)
             model.add_weight_wrapper(f"{name}.weight", _SVDInt4PackedMover(module))
     base_size = model.model_size()
     model.size = base_size + packed_bytes
