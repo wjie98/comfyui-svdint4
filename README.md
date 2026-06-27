@@ -32,8 +32,8 @@ Manager install or update the custom node without compiling CUDA code.
 Install the CUDA kernel in the same Python environment that runs ComfyUI:
 
 ```bash
-python -m pip install -v --no-build-isolation \
-  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+python -m pip install -v --no-build-isolation --no-cache-dir --no-deps --upgrade --force-reinstall \
+  "git+https://github.com/wjie98/comfyui-svdint4.git@main#subdirectory=kernel"
 ```
 
 For local development from an already cloned checkout:
@@ -47,12 +47,13 @@ To limit the architectures built for your machine:
 
 ```bash
 SVDINT4_ARCH_LIST="8.0;8.6" \
-python -m pip install -v --no-build-isolation \
-  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+python -m pip install -v --no-build-isolation --no-cache-dir --no-deps --upgrade --force-reinstall \
+  "git+https://github.com/wjie98/comfyui-svdint4.git@main#subdirectory=kernel"
 ```
 
-Use `--no-build-isolation` for local CUDA builds so pip uses the PyTorch already
-installed in your ComfyUI environment.
+Use `--no-build-isolation` so pip builds against the PyTorch already installed
+in your ComfyUI environment. Use `--no-deps` to avoid reinstalling or
+downloading PyTorch when rebuilding the kernel.
 
 If you must use the SSH URL, initialize GitHub's SSH host key in the same
 Windows account first:
@@ -187,8 +188,8 @@ quantized model and are not user LoRAs.
 Install the kernel in the same environment that launches ComfyUI:
 
 ```bash
-python -m pip install -v --no-build-isolation \
-  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+python -m pip install -v --no-build-isolation --no-cache-dir --no-deps --upgrade --force-reinstall \
+  "git+https://github.com/wjie98/comfyui-svdint4.git@main#subdirectory=kernel"
 ```
 
 `CUDA version mismatches the version that was used to compile PyTorch`
@@ -217,8 +218,8 @@ before running pip:
 
 ```powershell
 $env:VSLANG = "1033"
-python -m pip install -v --no-build-isolation `
-  "git+https://github.com/wjie98/comfyui-svdint4.git#subdirectory=kernel"
+python -m pip install -v --no-build-isolation --no-cache-dir --no-deps --upgrade --force-reinstall `
+  "git+https://github.com/wjie98/comfyui-svdint4.git@main#subdirectory=kernel"
 ```
 
 The model dropdown is empty
