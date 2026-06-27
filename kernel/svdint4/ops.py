@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -7,6 +8,24 @@ from torch import nn
 
 from . import _C
 from .packing import PackedInt4Weight, pack_bias, pack_linear_weight, pack_smooth
+
+CUDA_SYNC_ENV = "SVDINT4_CUDA_SYNC"
+
+
+def _validate_cuda_kernel_runtime(x: torch.Tensor, dtype: torch.dtype) -> None:
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 kernel inputs must be CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    sm = major * 10 + minor
+    if sm < 75:
+        raise RuntimeError(f"SVDInt4 requires NVIDIA Turing/sm75 or newer, got sm{sm}")
+    if dtype == torch.bfloat16 and sm < 80:
+        raise RuntimeError("SVDInt4 bfloat16 kernels require Ampere/sm80 or newer")
+
+
+def _sync_if_requested(x: torch.Tensor) -> None:
+    if os.environ.get(CUDA_SYNC_ENV) == "1":
+        torch.cuda.synchronize(x.device)
 
 
 def quantize_act_lora(
@@ -18,10 +37,13 @@ def quantize_act_lora(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.ndim != 2:
         raise ValueError("x must be 2D [M, K]")
+    _validate_cuda_kernel_runtime(x, x.dtype)
     if smooth_packed is None:
         smooth = torch.ones(svd_down_packed.shape[0], dtype=x.dtype, device=x.device)
         smooth_packed = pack_smooth(smooth, k_pad=svd_down_packed.shape[0])
-    return _C.quantize_act_lora(x.contiguous(), svd_down_packed.contiguous(), smooth_packed.contiguous(), pad_size)
+    result = _C.quantize_act_lora(x.contiguous(), svd_down_packed.contiguous(), smooth_packed.contiguous(), pad_size)
+    _sync_if_requested(x)
+    return result
 
 
 def gemm_svd(
@@ -38,7 +60,8 @@ def gemm_svd(
     act_unsigned: bool = False,
     lora_scales: list[float] | None = None,
 ) -> torch.Tensor:
-    return _C.gemm_svd(
+    _validate_cuda_kernel_runtime(qact, wscales.dtype)
+    result = _C.gemm_svd(
         qact.contiguous(),
         qweight.contiguous(),
         ascales.contiguous(),
@@ -51,6 +74,8 @@ def gemm_svd(
         act_unsigned,
         [] if lora_scales is None else lora_scales,
     )
+    _sync_if_requested(qact)
+    return result
 
 
 def linear_svd(
@@ -67,10 +92,11 @@ def linear_svd(
     lora_scales: list[float] | None = None,
     pad_size: int = 256,
 ) -> torch.Tensor:
+    _validate_cuda_kernel_runtime(x, x.dtype)
     if smooth_packed is None:
         smooth = torch.ones(svd_down_packed.shape[0], dtype=x.dtype, device=x.device)
         smooth_packed = pack_smooth(smooth, k_pad=svd_down_packed.shape[0])
-    return _C.linear_svd(
+    result = _C.linear_svd(
         x.contiguous(),
         qweight.contiguous(),
         wscales.contiguous(),
@@ -83,6 +109,8 @@ def linear_svd(
         [] if lora_scales is None else lora_scales,
         pad_size,
     )
+    _sync_if_requested(x)
+    return result
 
 
 def _extra_lora_delta(

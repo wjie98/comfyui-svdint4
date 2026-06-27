@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
 SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
-WINDOWS_KERNEL_OPT_IN = "SVDINT4_ENABLE_EXPERIMENTAL_WINDOWS_KERNEL"
+CUDA_SYNC_ENV = "SVDINT4_CUDA_SYNC"
 
 
 def _kernel_install_hint() -> str:
@@ -30,13 +29,6 @@ def _kernel_install_hint() -> str:
 
 
 def _load_svdint4_linear():
-    if platform.system() == "Windows" and os.environ.get(WINDOWS_KERNEL_OPT_IN) != "1":
-        raise RuntimeError(
-            "The SVDInt4 CUDA kernel is disabled by default on Windows because it has not "
-            "completed production validation there and may trigger a driver-level crash. "
-            f"Set {WINDOWS_KERNEL_OPT_IN}=1 only if you are intentionally testing the "
-            "experimental Windows kernel path. Linux remains the supported runtime path."
-        )
     try:
         from svdint4.ops import svd_int4_linear
     except Exception as exc:
@@ -46,6 +38,20 @@ def _load_svdint4_linear():
             f"SVDINT4_ARCH_LIST='7.5;8.0;8.6;8.9' {_kernel_install_hint()}"
         ) from exc
     return svd_int4_linear
+
+
+def _validate_cuda_kernel_runtime(x: torch.Tensor, compute_dtype: torch.dtype) -> None:
+    major, minor = torch.cuda.get_device_capability(x.device)
+    sm = major * 10 + minor
+    if sm < 75:
+        raise RuntimeError(f"SVDInt4 requires NVIDIA Turing/sm75 or newer, got sm{sm}")
+    if compute_dtype == torch.bfloat16 and sm < 80:
+        raise RuntimeError("SVDInt4 bfloat16 kernels require Ampere/sm80 or newer")
+
+
+def _sync_if_requested(x: torch.Tensor) -> None:
+    if os.environ.get(CUDA_SYNC_ENV) == "1":
+        torch.cuda.synchronize(x.device)
 
 
 def _split_packed_key(key: str) -> tuple[str, str] | None:
@@ -232,6 +238,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         if input.device.type != "cuda":
             raise RuntimeError("SVDInt4 Linear requires CUDA input tensors")
 
+        _validate_cuda_kernel_runtime(input, self.compute_dtype)
         svd_int4_linear = _load_svdint4_linear()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
@@ -246,6 +253,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             bias_packed=self.bias_packed,
             out_features=self.out_features,
         )
+        _sync_if_requested(x)
         return out if out.dtype == original_dtype else out.to(original_dtype)
 
 

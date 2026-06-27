@@ -195,21 +195,21 @@ python -m pip install -v --no-build-isolation \
 Make sure the CUDA toolkit used by `nvcc` matches your PyTorch CUDA version.
 For source builds, also make sure `--no-build-isolation` is present.
 
-Windows runtime
+Windows runtime debugging
 
-The Windows CUDA kernel path is disabled by default. The plugin can still be
-installed and the loader node can enumerate SVDInt4 DiT files, but sampling will
-raise a clear error before launching the custom CUDA kernel. This is deliberate:
-the current Windows runtime path has not completed production validation and a
-bad custom kernel launch can crash the NVIDIA driver.
+SVDInt4 supports Turing/sm75 or newer GPUs. BF16 SVDInt4 tensors require
+Ampere/sm80 or newer; Turing must use FP16 tensors. The loader checks these
+conditions before launching the custom CUDA kernel.
 
-For controlled testing only, opt in before starting ComfyUI:
+If Windows still reports a driver reset or crash, enable synchronous CUDA error
+reporting before starting ComfyUI:
 
 ```powershell
-$env:SVDINT4_ENABLE_EXPERIMENTAL_WINDOWS_KERNEL = "1"
+$env:SVDINT4_CUDA_SYNC = "1"
 ```
 
-Linux is the supported runtime path for the SVDInt4 kernel in this release.
+This makes each SVDInt4 op synchronize after launch so the Python traceback is
+closer to the failing operation. It is slower and intended for debugging only.
 
 `fatal error C1083: ... cusparse.h: No such file or directory`
 
