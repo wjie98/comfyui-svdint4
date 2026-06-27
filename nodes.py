@@ -11,6 +11,8 @@ FOLDER_NAME = "diffusion_models"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 ENV_PATHS = ("SVDINT4_DIT_PATHS", "SVDINT4_MODEL_PATHS")
 SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
+CACHE_MODES = ("auto", "resident", "stream")
+LORA_POLICIES = ("metadata", "packed_only", "external_bypass", "disabled")
 
 
 def _model_dirs() -> list[str]:
@@ -68,7 +70,21 @@ class SVDInt4DiffusionModelLoader:
                             "Only svdint4-dit-safetensors-v1 files are shown."
                         )
                     },
-                )
+                ),
+                "cache_mode": (
+                    CACHE_MODES,
+                    {
+                        "default": "auto",
+                        "tooltip": "auto keeps the active branch resident when VRAM allows; stream is safest; resident forces fast GPU cache.",
+                    },
+                ),
+                "lora_policy": (
+                    LORA_POLICIES,
+                    {
+                        "default": "metadata",
+                        "tooltip": "metadata/packed_only ignore LoRA patches targeting packed SVDInt4 Linear weights; external_bypass enables explicit adapter LoRA bypass.",
+                    },
+                ),
             }
         }
 
@@ -78,10 +94,10 @@ class SVDInt4DiffusionModelLoader:
     CATEGORY = "SVDInt4/loaders"
     TITLE = "Load SVDInt4 DiT"
 
-    def load_diffusion_model(self, unet_name: str):
+    def load_diffusion_model(self, unet_name: str, cache_mode: str = "auto", lora_policy: str = "metadata"):
         from .loader import load_svdint4_model
 
-        return (load_svdint4_model(_resolve_model_path(unet_name)),)
+        return (load_svdint4_model(_resolve_model_path(unet_name), cache_mode=cache_mode, lora_policy=lora_policy),)
 
 
 NODE_CLASS_MAPPINGS = {

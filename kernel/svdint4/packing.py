@@ -5,6 +5,21 @@ from dataclasses import dataclass
 import torch
 
 
+SVDINT4_METADATA_CONTRACT_VERSION = "1"
+SVDINT4_DEFAULT_METADATA = {
+    "format": "svdint4-dit-safetensors-v1",
+    "svdint4_contract_version": SVDINT4_METADATA_CONTRACT_VERSION,
+    "has_internal_svd_lora": "true",
+    "lora_policy": "packed_only",
+}
+
+
+def build_svdint4_metadata(**overrides: str) -> dict[str, str]:
+    metadata = dict(SVDINT4_DEFAULT_METADATA)
+    metadata.update({key: str(value) for key, value in overrides.items() if value is not None})
+    return metadata
+
+
 def ceil_divide(x: int, y: int) -> int:
     return (x + y - 1) // y
 

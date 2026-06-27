@@ -101,6 +101,9 @@ The file must use the SVDInt4 single-file layout:
 ```text
 metadata:
   format = svdint4-dit-safetensors-v1
+  svdint4_contract_version = 1
+  has_internal_svd_lora = true
+  lora_policy = packed_only
 
 tensors:
   blocks.N.self_attn.q.qweight
@@ -147,7 +150,9 @@ Convert each branch into one `.safetensors` file before using it in ComfyUI:
 4. Rename old internal low-rank keys:
    - `.lora_down` -> `.svd_down`
    - `.lora_up` -> `.svd_up`
-5. Save with metadata `format=svdint4-dit-safetensors-v1`.
+5. Save with metadata from `svdint4.packing.build_svdint4_metadata(...)`,
+   including `format=svdint4-dit-safetensors-v1`. For packed SVDQuant models,
+   keep `has_internal_svd_lora=true` and `lora_policy=packed_only`.
 
 High-noise and low-noise branches should become two separate files, for example:
 
@@ -160,26 +165,27 @@ bernini-low.safetensors
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`.
+  returns a ComfyUI `MODEL`. The node exposes:
+  - `cache_mode`: `auto`, `resident`, or `stream`
+  - `lora_policy`: `metadata`, `packed_only`, `external_bypass`, or `disabled`
 
 The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
 Packed SVDInt4 tensors are kept in CPU memory at model-load time. By default
-the loader uses `SVDINT4_CACHE_MODE=auto`: it keeps the active high/low branch
-resident on the GPU when there is enough free VRAM, and falls back to streaming
-packed tensors per Linear when there is not enough headroom. The loader reports
-the full packed model size to ComfyUI so VRAM planning can unload other models
-before denoising starts.
+`cache_mode=auto` keeps the active high/low branch resident on the GPU when
+there is enough free VRAM, and falls back to streaming packed tensors per Linear
+when there is not enough headroom. Resident packed tensors are loaded through
+ComfyUI's weight-function path, so they are included in ComfyUI's loaded model
+memory accounting. The loader reports the full packed model size to ComfyUI so
+VRAM planning can unload other models before denoising starts.
 
 For diagnostics, the loader logs the base fp16 bytes, packed SVDInt4 bytes,
 reported model size, resident GPU cache state, and cache release bytes.
 
-`SVDINT4_CACHE_MODE=resident` forces resident packed weights for benchmarking on
-high-VRAM systems. `SVDINT4_CACHE_MODE=stream` forces the safest low-VRAM path.
-The older `SVDINT4_RESIDENT_GPU_CACHE=1` variable is still accepted as an alias
-for `resident`.
+The `SVDINT4_CACHE_MODE` environment variable is kept as a legacy fallback for
+direct Python loading. The ComfyUI node option should be preferred.
 
 The node category is:
 
@@ -190,18 +196,17 @@ SVDInt4/loaders
 ## LoRA
 
 The packed SVDQuant low-rank tensors inside the model are part of the base
-quantized model and are not user LoRAs. The loader exposes empty meta `.weight`
-keys so ComfyUI can map standard LoRA names without allocating dense base
-weights.
+quantized model and are not user LoRAs. New files should declare this with
+`has_internal_svd_lora=true` and `lora_policy=packed_only`. Old files without
+these keys are treated as `packed_only`.
 
-`SVDINT4_LORA_BYPASS=auto` is the default. Standard adapter LoRAs can be applied
-as a forward bypass path, but full-coverage LoRA patches that touch most
-SVDInt4 layers are skipped in auto mode because they are usually duplicate
-model-internal SVDQuant adapters from the original workflow. Set
-`SVDINT4_LORA_BYPASS=on` to force an external full-model LoRA, or `off` to skip
-all bypass LoRA. Dense `diff`/`set` weight patches are intentionally not
-supported for packed SVDInt4 weights. Repack the model only when the LoRA is
-meant to become part of the quantized base.
+With `lora_policy=packed_only`, regular ComfyUI LoRA nodes may still load keys
+without warnings, but patches targeting packed SVDInt4 Linear weights are not
+applied. Set `lora_policy=external_bypass` only when you intentionally want a
+separate user LoRA adapter path on top of the packed model. Dense `diff`/`set`
+weight patches are intentionally not supported for packed SVDInt4 weights.
+Repack the model only when the LoRA is meant to become part of the quantized
+base.
 
 ## Smoke Tests
 
@@ -209,7 +214,9 @@ Local load and single-layer CUDA forward:
 
 ```bash
 python custom_nodes/comfyui-svdint4/scripts/smoke_test.py \
-  --model ComfyUI/models/diffusion_models/your-model.safetensors
+  --model ComfyUI/models/diffusion_models/your-model.safetensors \
+  --cache-mode auto \
+  --lora-policy metadata
 ```
 
 Real denoise smoke on a running ComfyUI server with an API-format workflow:
