@@ -9,10 +9,8 @@ from safetensors import safe_open
 
 FOLDER_NAME = "diffusion_models"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
-ENV_PATHS = ("SVDINT4_DIT_PATHS", "SVDINT4_MODEL_PATHS")
-SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
-CACHE_MODES = ("auto", "resident", "stream")
-LORA_POLICIES = ("metadata", "packed_only", "external_bypass", "disabled")
+ENV_PATHS = ("SVDINT4_DIT_PATHS",)
+SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 
 
 def _model_dirs() -> list[str]:
@@ -67,22 +65,15 @@ class SVDInt4DiffusionModelLoader:
                     {
                         "tooltip": (
                             "SVDInt4 DiT file from ComfyUI/models/diffusion_models. "
-                            "Only svdint4-dit-safetensors-v1 files are shown."
+                            "Only supported SVDInt4 single-file safetensors assets are shown."
                         )
                     },
                 ),
-                "cache_mode": (
-                    CACHE_MODES,
+                "external_lora_bypass": (
+                    "BOOLEAN",
                     {
-                        "default": "auto",
-                        "tooltip": "auto keeps the active branch resident when VRAM allows; stream is safest; resident forces fast GPU cache.",
-                    },
-                ),
-                "lora_policy": (
-                    LORA_POLICIES,
-                    {
-                        "default": "metadata",
-                        "tooltip": "metadata/packed_only ignore LoRA patches targeting packed SVDInt4 Linear weights; external_bypass enables explicit adapter LoRA bypass.",
+                        "default": False,
+                        "tooltip": "Run standard adapter LoRAs as fp16 forward bypass paths instead of ignoring packed Linear LoRA patches.",
                     },
                 ),
             }
@@ -94,10 +85,14 @@ class SVDInt4DiffusionModelLoader:
     CATEGORY = "SVDInt4/loaders"
     TITLE = "Load SVDInt4 DiT"
 
-    def load_diffusion_model(self, unet_name: str, cache_mode: str = "auto", lora_policy: str = "metadata"):
+    def load_diffusion_model(
+        self,
+        unet_name: str,
+        external_lora_bypass: bool = False,
+    ):
         from .loader import load_svdint4_model
 
-        return (load_svdint4_model(_resolve_model_path(unet_name), cache_mode=cache_mode, lora_policy=lora_policy),)
+        return (load_svdint4_model(_resolve_model_path(unet_name), external_lora_bypass=external_lora_bypass),)
 
 
 NODE_CLASS_MAPPINGS = {

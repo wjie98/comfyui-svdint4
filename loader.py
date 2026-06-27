@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
+import uuid
 from pathlib import Path
-import threading
-import weakref
 
 import torch
 import torch.nn as nn
 from safetensors import safe_open
 
 import comfy.ops
-import comfy.quant_ops
 import comfy.sd
 import comfy.weight_adapter
 from comfy.patcher_extension import CallbacksMP
@@ -33,78 +30,10 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
-SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
+SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 COMPUTE_DTYPE = torch.float16
-ACCOUNTING_TOLERANCE_BYTES = 16 * 1024 * 1024
-GIB = 1024 * 1024 * 1024
-_TRUE_ENV = {"1", "true", "yes", "on"}
-_CACHE_MODES = {"auto", "resident", "stream"}
-_LORA_POLICIES = {"metadata", "packed_only", "external_bypass", "disabled"}
-_ACTIVE_MODEL_ROOTS = weakref.WeakSet()
-METADATA_CONTRACT_VERSION = "1"
-METADATA_DEFAULTS = {
-    "svdint4_contract_version": METADATA_CONTRACT_VERSION,
-    "has_internal_svd_lora": "true",
-    "lora_policy": "packed_only",
-}
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
-
-
-def _env_mode(name: str, default: str, valid: set[str]) -> str:
-    value = os.environ.get(name, default).strip().lower()
-    if value not in valid:
-        LOG.warning("%s=%r is invalid; using %s", name, value, default)
-        return default
-    return value
-
-
-def _cache_mode() -> str:
-    if os.environ.get("SVDINT4_RESIDENT_GPU_CACHE", "").lower() in _TRUE_ENV:
-        return "resident"
-    return _env_mode("SVDINT4_CACHE_MODE", "auto", _CACHE_MODES)
-
-
-def _legacy_lora_policy() -> str | None:
-    value = os.environ.get("SVDINT4_LORA_BYPASS")
-    if value is None:
-        return None
-    value = value.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return "external_bypass"
-    if value in {"0", "false", "no", "off"}:
-        return "disabled"
-    if value in _LORA_POLICIES:
-        return value
-    LOG.warning("SVDINT4_LORA_BYPASS=%r is invalid; ignoring it", value)
-    return None
-
-
-def _metadata_bool(metadata: dict[str, str], key: str, default: bool) -> bool:
-    value = metadata.get(key)
-    if value is None:
-        return default
-    return str(value).strip().lower() in _TRUE_ENV
-
-
-def _metadata_lora_policy(metadata: dict[str, str]) -> str:
-    policy = metadata.get("lora_policy")
-    if policy in _LORA_POLICIES - {"metadata"}:
-        return policy
-    if policy is not None:
-        LOG.warning("Unsupported SVDInt4 lora_policy=%r; using packed_only", policy)
-    return "packed_only" if _metadata_bool(metadata, "has_internal_svd_lora", True) else "external_bypass"
-
-
-def _resolve_lora_policy(metadata: dict[str, str], requested: str) -> str:
-    legacy = _legacy_lora_policy()
-    if legacy is not None:
-        return _metadata_lora_policy(metadata) if legacy == "metadata" else legacy
-    if requested == "metadata":
-        return _metadata_lora_policy(metadata)
-    if requested not in _LORA_POLICIES:
-        LOG.warning("SVDInt4 lora_policy=%r is invalid; using metadata", requested)
-        return _metadata_lora_policy(metadata)
-    return requested
+SVDINT4_STATE_PREFIX = "svdint4_"
 
 
 def _kernel_install_hint() -> str:
@@ -297,13 +226,7 @@ if _HAS_COMFY_QUANTIZED_TENSOR:
 
 
 class SVDInt4PackedTensor:
-    """Packed SVDInt4 weight storage for one logical Linear weight.
-
-    ComfyUI's dynamic loader treats a non-None module.weight as a dense tensor
-    unless it is one of its registered QuantizedTensor layouts. Keep this object
-    as the internal packed storage for now, and expose only a zero-sized state
-    view for key discovery/accounting.
-    """
+    """Packed SVDInt4 weight storage for one logical Linear weight."""
 
     is_svdint4_packed_tensor = True
 
@@ -320,10 +243,8 @@ class SVDInt4PackedTensor:
         self.out_features = int(out_features)
         self.shape = torch.Size((self.out_features, self.in_features))
         self.dtype = compute_dtype
-        self.device = torch.device("cpu")
         self.requires_grad = False
         self.has_bias_packed = "bias_packed" in tensors
-        self._owner_model = None
         qweight = tensors["qweight"].contiguous()
         wscales = tensors["wscales"].contiguous()
         smooth = tensors.get("smooth")
@@ -351,20 +272,10 @@ class SVDInt4PackedTensor:
             self.tensor = QuantizedTensor(qweight, SVDINT4_LAYOUT_NAME, params)
         else:
             self.tensor = None
-        self._cpu_tensors: dict[str, torch.Tensor | None] = {
-            "qweight": qweight,
-            "wscales": wscales,
-            "smooth": smooth if has_smooth else None,
-            "svd_down": svd_down,
-            "svd_up": svd_up,
-            "bias_packed": bias_packed if self.has_bias_packed else None,
-        }
-        self._gpu_tensors: dict[torch.device, dict[str, torch.Tensor | None]] = {}
-        self._gpu_bytes: dict[torch.device, int] = {}
-        self._gpu_loaded_bytes: dict[torch.device, int] = {}
-        self._cache_lock = threading.RLock()
-        self.packed_nbytes = sum(_tensor_nbytes(value) for value in self._cpu_tensors.values())
-        self.state_nbytes = _tensor_nbytes(qweight) if self.tensor is not None else 0
+        self.packed_nbytes = sum(
+            _tensor_nbytes(value)
+            for value in (qweight, wscales, smooth if has_smooth else None, svd_down, svd_up, bias_packed if self.has_bias_packed else None)
+        )
 
     @property
     def nbytes(self) -> int:
@@ -375,132 +286,6 @@ class SVDInt4PackedTensor:
 
     def element_size(self) -> int:
         return torch.tensor([], dtype=self.dtype).element_size()
-
-    def set_owner_model(self, owner_model) -> None:
-        self._owner_model = owner_model
-
-    def state_dict_tensor(self) -> torch.Tensor:
-        if self.tensor is not None:
-            return self.tensor
-        return torch.empty((0,), device="meta", dtype=self.dtype)
-
-    def to(self, *args, **kwargs) -> "SVDInt4PackedTensor":
-        device = kwargs.get("device")
-        if device is None:
-            for arg in args:
-                if isinstance(arg, torch.Tensor):
-                    device = arg.device
-                    break
-                if isinstance(arg, (torch.device, str, int)):
-                    device = arg
-                    break
-        target = torch.device(device) if device is not None else None
-        self.move_to(target)
-        return self
-
-    def move_to(self, device=None, account_loaded: bool = False) -> int:
-        if getattr(device, "type", None) == "cuda" and self.use_resident_cache(device):
-            return self.cache_tensors_on(device, account_loaded=account_loaded)
-        if device is None or getattr(device, "type", None) == "cpu":
-            return self.release_gpu_tensors(account_loaded=account_loaded)
-        return 0
-
-    def owner_model(self):
-        return self._owner_model() if self._owner_model is not None else None
-
-    def use_resident_cache(self, device: torch.device) -> bool:
-        owner = self.owner_model()
-        if owner is None:
-            return False
-        mode = _select_cache_policy(owner, device)
-        return mode == "resident" and device.type == "cuda"
-
-    def account_gpu_bytes(self, cached_delta: int, loaded_delta: int = 0) -> None:
-        owner = self.owner_model()
-        if owner is None:
-            return
-        owner._svdint4_cached_gpu_bytes = max(0, getattr(owner, "_svdint4_cached_gpu_bytes", 0) + cached_delta)
-        if loaded_delta and hasattr(owner, "model_loaded_weight_memory"):
-            owner.model_loaded_weight_memory = max(0, owner.model_loaded_weight_memory + loaded_delta)
-
-    def release_gpu_tensors(self, account_loaded: bool) -> int:
-        with self._cache_lock:
-            released = sum(self._gpu_bytes.values())
-            loaded_released = released
-            self._gpu_tensors.clear()
-            self._gpu_bytes.clear()
-            self._gpu_loaded_bytes.clear()
-        if released:
-            self.account_gpu_bytes(-released, -loaded_released if account_loaded else 0)
-        return released
-
-    def copy_tensors_to(self, device: torch.device) -> dict[str, torch.Tensor | None]:
-        tensors: dict[str, torch.Tensor | None] = {}
-        for name, value in self._cpu_tensors.items():
-            if value is None:
-                tensors[name] = None
-                continue
-            dtype = self.dtype if value.dtype in (torch.float16, torch.bfloat16, torch.float32) else value.dtype
-            tensors[name] = value.to(device=device, dtype=dtype, non_blocking=True)
-        return tensors
-
-    def cache_tensors_on(self, device: torch.device, account_loaded: bool) -> int:
-        cached = self._gpu_tensors.get(device)
-        if cached is not None:
-            return 0
-
-        with self._cache_lock:
-            cached = self._gpu_tensors.get(device)
-            if cached is not None:
-                return 0
-
-            try:
-                tensors = self.copy_tensors_to(device)
-            except torch.OutOfMemoryError:
-                released = 0
-                owner = self.owner_model()
-                if owner is not None:
-                    owner._svdint4_effective_cache_mode = "stream"
-                    released = _release_root_gpu_tensors(owner, account_loaded=account_loaded)
-                LOG.warning(
-                    "SVDInt4 resident cache ran out of VRAM while loading %s; falling back to stream mode",
-                    self.name,
-                )
-                return -released if not account_loaded else 0
-
-            moved = sum(_tensor_nbytes(value) for value in tensors.values())
-            loaded_moved = moved if account_loaded else max(0, moved - self.state_nbytes)
-            self._gpu_tensors[device] = tensors
-            self._gpu_bytes[device] = moved
-            self._gpu_loaded_bytes[device] = loaded_moved
-
-        self.account_gpu_bytes(moved, loaded_moved if account_loaded else 0)
-        LOG.debug("SVDInt4 cached %.2f MB for %s on %s", _mb(moved), self.name, device)
-        return moved if account_loaded else loaded_moved
-
-    def tensors_for(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
-        device = x.device
-        if not self.use_resident_cache(device):
-            return self.copy_tensors_to(device)
-
-        self.cache_tensors_on(device, account_loaded=True)
-        cached = self._gpu_tensors.get(device)
-        if cached is None:
-            return self.copy_tensors_to(device)
-        return cached
-
-
-class _SVDInt4PackedMover:
-    is_svdint4_packed_mover = True
-
-    def __init__(self, module: "SVDInt4LinearOp"):
-        self._module = weakref.ref(module)
-
-    def move_to(self, device=None) -> int:
-        module = self._module()
-        if module is not None and module.packed_weight is not None:
-            return module.packed_weight.move_to(device, account_loaded=False)
-        return 0
 
 
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
@@ -520,7 +305,6 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.bias = None
         self.is_svdint4 = False
         self.compute_dtype = COMPUTE_DTYPE
-        self._svdint4_owner_model = None
         self.packed_name = None
         self.packed_weight: SVDInt4PackedTensor | None = None
         self._svdint4_lora_patches = []
@@ -588,26 +372,33 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             tensors=tensors,
             compute_dtype=self.compute_dtype,
         )
-        self.weight = self.packed_weight.tensor
+        if self.packed_weight.tensor is None:
+            raise RuntimeError("SVDInt4 requires ComfyUI QuantizedTensor support")
+        self.weight = nn.Parameter(self.packed_weight.tensor, requires_grad=False)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         if not self.is_svdint4:
             return nn.Module._save_to_state_dict(self, destination, prefix, keep_vars)
-        if self.packed_weight is None:
+        if self.packed_weight is None or self.weight is None:
             return
-        destination[prefix + "weight"] = self.packed_weight.state_dict_tensor()
-        if self.has_bias_packed:
-            destination[prefix + "bias"] = torch.empty((0,), device="meta", dtype=self.compute_dtype)
+        tensors = self._packed_tensors_from_weight(self.weight)
+        for field, value in tensors.items():
+            if value is None:
+                continue
+            destination[prefix + SVDINT4_STATE_PREFIX + field] = value if keep_vars else value.detach()
 
-    def _release_gpu_tensors(self, account_loaded: bool) -> int:
-        if self.packed_weight is None:
-            return 0
-        return self.packed_weight.release_gpu_tensors(account_loaded=account_loaded)
-
-    def _packed_tensors_for(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
-        if self.packed_weight is None:
-            raise RuntimeError("SVDInt4 packed weight is not loaded")
-        return self.packed_weight.tensors_for(x)
+    def _packed_tensors_from_weight(self, weight) -> dict[str, torch.Tensor | None]:
+        if not isinstance(weight, QuantizedTensor) or getattr(weight, "_layout_cls", None) != SVDINT4_LAYOUT_NAME:
+            raise RuntimeError("SVDInt4 Linear expected a ComfyUI-managed SVDInt4 QuantizedTensor weight")
+        params = weight._params
+        return {
+            "qweight": weight._qdata,
+            "wscales": params.wscales,
+            "smooth": params.smooth if params.has_smooth else None,
+            "svd_down": params.svd_down,
+            "svd_up": params.svd_up,
+            "bias_packed": params.bias_packed if params.has_bias_packed else None,
+        }
 
     def _warn_lora_once(self, code: str, message: str, *args) -> None:
         if code in self._svdint4_lora_warnings:
@@ -690,17 +481,32 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         svd_int4_linear = _load_svdint4_linear()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
-        tensors = self._packed_tensors_for(x)
-        out = svd_int4_linear(
-            x,
-            tensors["qweight"],
-            tensors["wscales"],
-            tensors["svd_down"],
-            tensors["svd_up"],
-            smooth_packed=tensors["smooth"],
-            bias_packed=tensors["bias_packed"],
-            out_features=self.out_features,
-        )
+        saved_weight_function = self.weight_function
+        self.weight_function = []
+        weight = None
+        offload_stream = None
+        try:
+            weight, _, offload_stream = comfy.ops.cast_bias_weight(
+                self,
+                input=x,
+                dtype=self.compute_dtype,
+                offloadable=True,
+            )
+            tensors = self._packed_tensors_from_weight(weight)
+            out = svd_int4_linear(
+                x,
+                tensors["qweight"],
+                tensors["wscales"],
+                tensors["svd_down"],
+                tensors["svd_up"],
+                smooth_packed=tensors["smooth"],
+                bias_packed=tensors["bias_packed"],
+                out_features=self.out_features,
+            )
+        finally:
+            self.weight_function = saved_weight_function
+            if weight is not None:
+                comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
         out = self._apply_lora_bypass(x, out)
         return out if out.dtype == original_dtype else out.to(original_dtype)
 
@@ -725,7 +531,7 @@ def build_loader_state_dict(
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
     with safe_open(model_path, framework="pt", device="cpu") as handle:
-        metadata = {**METADATA_DEFAULTS, **(handle.metadata() or {})}
+        metadata = handle.metadata() or {}
         _validate_metadata(metadata, model_path)
         packed_layers = _collect_packed_layers_from_handle(handle)
         if not packed_layers:
@@ -758,153 +564,96 @@ def build_loader_state_dict(
     return state_dict, metadata, packed_layer_tensors
 
 
-def _release_root_gpu_tensors(root, account_loaded: bool) -> int:
-    released = 0
-    for module in root.modules():
-        if getattr(module, "is_svdint4", False):
-            released += module._release_gpu_tensors(account_loaded=account_loaded)
-    return released
+def _patch_key_name(key) -> str:
+    if isinstance(key, str):
+        return key
+    return key[0]
 
 
-def _release_model_gpu_tensors(model_patcher, *_) -> None:
-    released = _release_root_gpu_tensors(model_patcher.model, account_loaded=True)
-    if released:
-        LOG.info("SVDInt4 released %.2f MB of cached GPU packed tensors", _mb(released))
+def _patch_key_offset_function(key):
+    if isinstance(key, str):
+        return None, None
+    offset = key[1]
+    function = key[2] if len(key) > 2 else None
+    return offset, function
 
 
-def _release_other_model_gpu_tensors(root) -> int:
-    released = 0
-    for other in list(_ACTIVE_MODEL_ROOTS):
-        if other is root:
-            continue
-        released += _release_root_gpu_tensors(other, account_loaded=True)
-    if released:
-        LOG.info("SVDInt4 released %.2f MB of cached GPU packed tensors from inactive model(s)", _mb(released))
-    return released
-
-
-def _cache_headroom_bytes(total: int) -> int:
-    return max(4 * GIB, total // 4)
-
-
-def _select_cache_policy(root, device: torch.device) -> str:
-    device_key = str(device)
-    selected = getattr(root, "_svdint4_effective_cache_mode", None)
-    if selected in {"resident", "stream"} and getattr(root, "_svdint4_cache_policy_device", None) == device_key:
-        return selected
-
-    requested = getattr(root, "_svdint4_requested_cache_mode", "auto")
-    if requested in {"resident", "stream"}:
-        root._svdint4_effective_cache_mode = requested
-        root._svdint4_cache_policy_device = device_key
-        if requested == "resident":
-            _release_other_model_gpu_tensors(root)
-        return requested
-
-    packed_total = int(getattr(root, "_svdint4_packed_bytes", 0))
-    if device is None or getattr(device, "type", None) != "cuda" or packed_total <= 0:
-        root._svdint4_effective_cache_mode = "stream"
-        root._svdint4_cache_policy_device = device_key
-        return "stream"
-
-    _release_other_model_gpu_tensors(root)
-    try:
-        free, total = torch.cuda.mem_get_info(device)
-    except Exception as exc:
-        LOG.warning("SVDInt4 could not query CUDA free memory for cache policy: %s", exc)
-        root._svdint4_effective_cache_mode = "stream"
-        root._svdint4_cache_policy_device = device_key
-        return "stream"
-
-    headroom = _cache_headroom_bytes(total)
-    if free >= packed_total + headroom:
-        root._svdint4_effective_cache_mode = "resident"
-    else:
-        root._svdint4_effective_cache_mode = "stream"
-    root._svdint4_cache_policy_device = device_key
-    LOG.info(
-        "SVDInt4 cache policy: requested auto -> %s (free %.2f MB, packed %.2f MB, headroom %.2f MB)",
-        root._svdint4_effective_cache_mode,
-        _mb(free),
-        _mb(packed_total),
-        _mb(headroom),
-    )
-    return root._svdint4_effective_cache_mode
-
-
-def _normalize_model_accounting(model_patcher) -> None:
-    root = model_patcher.model
-    packed_total = int(getattr(root, "_svdint4_packed_bytes", 0))
-    cached = int(getattr(root, "_svdint4_cached_gpu_bytes", 0))
-    visible_state = int(getattr(root, "_svdint4_packed_state_bytes", 0))
-    loaded = int(getattr(root, "model_loaded_weight_memory", 0))
-    if visible_state > 0:
-        unmaterialized_visible = max(0, visible_state - min(cached, visible_state))
-        if unmaterialized_visible > 0 and loaded > unmaterialized_visible:
-            root.model_loaded_weight_memory = max(0, loaded - unmaterialized_visible)
-            loaded = int(root.model_loaded_weight_memory)
-            LOG.info(
-                "SVDInt4 corrected visible packed accounting: loaded %.2f MB -> %.2f MB "
-                "(visible %.2f MB, cached %.2f MB)",
-                _mb(loaded + unmaterialized_visible),
-                _mb(loaded),
-                _mb(visible_state),
-                _mb(cached),
-            )
-
-    unmaterialized = max(0, packed_total - cached)
-    if packed_total <= 0 or unmaterialized <= 0:
+def _install_svdint4_patch_filter() -> None:
+    add_patches = comfy.model_patcher.ModelPatcher.add_patches
+    if getattr(add_patches, "_svdint4_filter_installed", False):
         return
 
-    reported = int(model_patcher.model_size())
-    if loaded >= reported - ACCOUNTING_TOLERANCE_BYTES:
-        root.model_loaded_weight_memory = max(0, loaded - unmaterialized)
-        LOG.info(
-            "SVDInt4 corrected full-load accounting: loaded %.2f MB -> %.2f MB "
-            "(packed %.2f MB, cached %.2f MB)",
-            _mb(loaded),
-            _mb(root.model_loaded_weight_memory),
-            _mb(packed_total),
-            _mb(cached),
-        )
+    def svdint4_add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        packed_weight_keys = getattr(self.model, "_svdint4_weight_keys", None)
+        if not packed_weight_keys:
+            return add_patches(self, patches, strength_patch, strength_model)
+
+        passthrough = {}
+        handled = set()
+        external_bypass = bool(getattr(self.model, "_svdint4_external_lora_bypass", False))
+        pending = getattr(self.model, "_svdint4_pending_lora_patches", None)
+        if pending is None:
+            pending = {}
+            self.model._svdint4_pending_lora_patches = pending
+
+        ignored = int(getattr(self.model, "_svdint4_ignored_lora_patch_count", 0))
+        bypassed = int(getattr(self.model, "_svdint4_bypass_lora_patch_count", 0))
+        skipped = int(getattr(self.model, "_svdint4_skipped_lora_patch_count", 0))
+
+        for key, patch_data in patches.items():
+            weight_key = _patch_key_name(key)
+            if weight_key not in packed_weight_keys:
+                passthrough[key] = patch_data
+                continue
+
+            handled.add(key)
+            offset, function = _patch_key_offset_function(key)
+            if external_bypass and isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+                pending.setdefault(weight_key, []).append((strength_patch, patch_data, strength_model, offset, function))
+                bypassed += 1
+            else:
+                if external_bypass:
+                    skipped += 1
+                else:
+                    ignored += 1
+
+        patched = set(add_patches(self, passthrough, strength_patch, strength_model)) if passthrough else set()
+        if handled:
+            self.model._svdint4_ignored_lora_patch_count = ignored
+            self.model._svdint4_bypass_lora_patch_count = bypassed
+            self.model._svdint4_skipped_lora_patch_count = skipped
+            self.patches_uuid = uuid.uuid4()
+            patched.update(handled)
+        return list(patched)
+
+    svdint4_add_patches._svdint4_filter_installed = True
+    comfy.model_patcher.ModelPatcher.add_patches = svdint4_add_patches
 
 
 def _attach_lora_bypass_patches(model_patcher) -> None:
-    policy = getattr(model_patcher.model, "_svdint4_lora_policy", "packed_only")
+    external_lora_bypass = bool(getattr(model_patcher.model, "_svdint4_external_lora_bypass", False))
     adapter_count = 0
-    skipped_count = 0
-    pending: list[tuple[SVDInt4LinearOp, list]] = []
+    pending_patches = getattr(model_patcher.model, "_svdint4_pending_lora_patches", {}) or {}
     for name, module in model_patcher.model.named_modules():
         if not getattr(module, "is_svdint4", False):
             continue
 
-        patches = model_patcher.patches.get(f"{name}.weight", [])
-        bypass_patches = []
-        for patch in patches:
-            patch_data = patch[1]
-            if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
-                bypass_patches.append(patch)
-            else:
-                skipped_count += 1
-        pending.append((module, bypass_patches))
+        bypass_patches = pending_patches.get(f"{name}.weight", [])
+        module._svdint4_lora_patches = bypass_patches if external_lora_bypass else []
         adapter_count += len(bypass_patches)
 
-    if policy in {"packed_only", "disabled"}:
-        for module, _ in pending:
-            module._svdint4_lora_patches = []
-        if adapter_count or skipped_count:
+    if not external_lora_bypass:
+        ignored_count = int(getattr(model_patcher.model, "_svdint4_ignored_lora_patch_count", 0))
+        if ignored_count:
             LOG.info(
-                "SVDInt4 LoRA policy %s ignored %d adapter patch(es) targeting packed Linear weights",
-                policy,
-                adapter_count,
+                "SVDInt4 ignored %d adapter patch(es) targeting packed Linear weights; enable external_lora_bypass to run them as fp16 forward bypass paths",
+                ignored_count,
             )
         return
 
-    for module, bypass_patches in pending:
-        module._svdint4_lora_patches = bypass_patches
-
     if adapter_count:
         LOG.info("SVDInt4 attached %d LoRA adapter patches as forward bypass paths", adapter_count)
+    skipped_count = int(getattr(model_patcher.model, "_svdint4_skipped_lora_patch_count", 0))
     if skipped_count:
         LOG.warning(
             "SVDInt4 ignored %d non-adapter LoRA patches; dense diff/set patches are not supported for packed weights",
@@ -913,34 +662,39 @@ def _attach_lora_bypass_patches(model_patcher) -> None:
 
 
 def _after_model_load(model_patcher, *_) -> None:
-    _ACTIVE_MODEL_ROOTS.add(model_patcher.model)
     _attach_lora_bypass_patches(model_patcher)
-    _normalize_model_accounting(model_patcher)
     root = model_patcher.model
     LOG.info(
-        "SVDInt4 load state: cache %s, reported %.2f MB, loaded %.2f MB, packed %.2f MB, cached %.2f MB",
-        getattr(root, "_svdint4_effective_cache_mode", None) or "stream",
+        "SVDInt4 load state: reported %.2f MB, loaded %.2f MB, packed %.2f MB, visible %.2f MB",
         _mb(model_patcher.model_size()),
         _mb(getattr(root, "model_loaded_weight_memory", 0)),
         _mb(getattr(root, "_svdint4_packed_bytes", 0)),
-        _mb(getattr(root, "_svdint4_cached_gpu_bytes", 0)),
+        _mb(getattr(root, "_svdint4_packed_state_bytes", 0)),
+    )
+
+
+def _load_svdint4_model_cached(
+    model_path: str | Path,
+    external_lora_bypass: bool = False,
+    disable_dynamic: bool = False,
+):
+    return load_svdint4_model(
+        model_path,
+        disable_dynamic=disable_dynamic,
+        external_lora_bypass=external_lora_bypass,
     )
 
 
 def load_svdint4_model(
     model_path: str | Path,
     disable_dynamic: bool = False,
-    cache_mode: str = "auto",
-    lora_policy: str = "metadata",
+    external_lora_bypass: bool = False,
 ):
+    _install_svdint4_patch_filter()
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
-    packed_state_bytes = (
-        sum(_tensor_nbytes(fields["qweight"]) for fields in packed_layer_tensors.values())
-        if _HAS_COMFY_QUANTIZED_TENSOR
-        else 0
-    )
+    packed_state_bytes = packed_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
     try:
         model = comfy.sd.load_diffusion_model_state_dict(
             state_dict,
@@ -959,36 +713,30 @@ def load_svdint4_model(
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.model._svdint4_packed_bytes = packed_bytes
     model.model._svdint4_packed_state_bytes = packed_state_bytes
-    model.model._svdint4_cached_gpu_bytes = 0
-    model.model._svdint4_requested_cache_mode = cache_mode if cache_mode in _CACHE_MODES else _cache_mode()
-    model.model._svdint4_effective_cache_mode = None
-    model.model._svdint4_cache_policy_device = None
-    model.model._svdint4_lora_policy = _resolve_lora_policy(metadata, lora_policy)
+    model.model._svdint4_external_lora_bypass = bool(external_lora_bypass)
+    model.model._svdint4_pending_lora_patches = {}
+    model.model._svdint4_ignored_lora_patch_count = 0
+    model.model._svdint4_bypass_lora_patch_count = 0
+    model.model._svdint4_skipped_lora_patch_count = 0
     model.model._svdint4_metadata = metadata
-    _ACTIVE_MODEL_ROOTS.add(model.model)
+    packed_weight_keys = set()
     for name, module in model.model.named_modules():
         if getattr(module, "is_svdint4", False):
-            owner_ref = weakref.ref(model.model)
-            module._svdint4_owner_model = owner_ref
-            if module.packed_weight is not None:
-                module.packed_weight.set_owner_model(owner_ref)
-            model.add_weight_wrapper(f"{name}.weight", _SVDInt4PackedMover(module))
+            module.weight_function = []
+            packed_weight_keys.add(f"{name}.weight")
+    model.model._svdint4_weight_keys = frozenset(packed_weight_keys)
     base_size = model.model_size()
-    model.size = base_size + max(0, packed_bytes - packed_state_bytes)
+    model.size = base_size
     LOG.info(
         "SVDInt4 model accounting: base %.2f MB, packed %.2f MB, reported %.2f MB",
         _mb(base_size),
         _mb(packed_bytes),
         _mb(model.size),
     )
-    LOG.info("SVDInt4 cache policy requested: %s", model.model._svdint4_requested_cache_mode)
     LOG.info(
-        "SVDInt4 LoRA policy: %s; standard adapter LoRAs can run as forward bypass paths only under external_bypass, "
-        "dense diff/set LoRA patches are unsupported for packed weights.",
-        model.model._svdint4_lora_policy,
+        "SVDInt4 external LoRA bypass: %s; dense diff/set LoRA patches are unsupported for packed weights.",
+        model.model._svdint4_external_lora_bypass,
     )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
-    model.add_callback(CallbacksMP.ON_DETACH, _release_model_gpu_tensors)
-    model.add_callback(CallbacksMP.ON_CLEANUP, _release_model_gpu_tensors)
-    model.cached_patcher_init = (load_svdint4_model, (str(model_path), disable_dynamic, cache_mode, lora_policy))
+    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), external_lora_bypass))
     return model

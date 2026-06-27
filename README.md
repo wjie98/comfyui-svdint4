@@ -100,10 +100,7 @@ The file must use the SVDInt4 single-file layout:
 
 ```text
 metadata:
-  format = svdint4-dit-safetensors-v1
-  svdint4_contract_version = 1
-  has_internal_svd_lora = true
-  lora_policy = packed_only
+  format = svdint4-dit-single-v2
 
 tensors:
   blocks.N.self_attn.q.qweight
@@ -116,12 +113,14 @@ tensors:
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
 
-The node scans the existing `diffusion_models` paths, including legacy
-`models/unet`, and only shows files whose metadata has
-`format=svdint4-dit-safetensors-v1`. For custom model locations, set
-`SVDINT4_DIT_PATHS` before starting ComfyUI. Separate multiple paths with `:` on
-Linux/macOS or `;` on Windows. `SVDINT4_MODEL_PATHS` is still accepted for
-backward compatibility.
+Only the `format` metadata is required in the weight file. Keep provenance,
+calibration notes, source paths, and experiment policy in a sidecar JSON if you
+need them.
+
+The node scans ComfyUI's `diffusion_models` paths and only shows supported
+SVDInt4 files. For custom model locations, set `SVDINT4_DIT_PATHS` before
+starting ComfyUI. Separate multiple paths with `:` on Linux/macOS or `;` on
+Windows.
 
 ## Converting Shard Packs
 
@@ -150,9 +149,7 @@ Convert each branch into one `.safetensors` file before using it in ComfyUI:
 4. Rename old internal low-rank keys:
    - `.lora_down` -> `.svd_down`
    - `.lora_up` -> `.svd_up`
-5. Save with metadata from `svdint4.packing.build_svdint4_metadata(...)`,
-   including `format=svdint4-dit-safetensors-v1`. For packed SVDQuant models,
-   keep `has_internal_svd_lora=true` and `lora_policy=packed_only`.
+5. Save with minimal metadata: `format=svdint4-dit-single-v2`.
 
 High-noise and low-noise branches should become two separate files, for example:
 
@@ -161,31 +158,33 @@ bernini-high.safetensors
 bernini-low.safetensors
 ```
 
+To repack an existing single-file asset into the minimal v2 metadata layout:
+
+```bash
+python custom_nodes/comfyui-svdint4/scripts/repack_single_file.py \
+  --input old-high.safetensors \
+  --output bernini-high.safetensors
+```
+
+The script writes original metadata and basic provenance to
+`bernini-high.safetensors.json` instead of embedding it in the weight file.
+
 ## Nodes
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`. The node exposes:
-  - `cache_mode`: `auto`, `resident`, or `stream`
-  - `lora_policy`: `metadata`, `packed_only`, `external_bypass`, or `disabled`
+  returns a ComfyUI `MODEL`. The node exposes one policy option:
+  `external_lora_bypass`.
 
 The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
-Packed SVDInt4 tensors are kept in CPU memory at model-load time. By default
-`cache_mode=auto` keeps the active high/low branch resident on the GPU when
-there is enough free VRAM, and falls back to streaming packed tensors per Linear
-when there is not enough headroom. Resident packed tensors are loaded through
-ComfyUI's weight-function path, so they are included in ComfyUI's loaded model
-memory accounting. The loader reports the full packed model size to ComfyUI so
-VRAM planning can unload other models before denoising starts.
-
-For diagnostics, the loader logs the base fp16 bytes, packed SVDInt4 bytes,
-reported model size, resident GPU cache state, and cache release bytes.
-
-The `SVDINT4_CACHE_MODE` environment variable is kept as a legacy fallback for
-direct Python loading. The ComfyUI node option should be preferred.
+Packed SVDInt4 weights are represented internally as ComfyUI QuantizedTensor
+weights so ComfyUI can account for and move their qweight, scales, smooth
+factors, and SVD tensors together. The public `state_dict()` does not expose
+packed weights as normal `.weight` tensors, so standard ComfyUI LoRA patching
+does not accidentally treat them as dense fp16 weights.
 
 The node category is:
 
@@ -196,17 +195,12 @@ SVDInt4/loaders
 ## LoRA
 
 The packed SVDQuant low-rank tensors inside the model are part of the base
-quantized model and are not user LoRAs. New files should declare this with
-`has_internal_svd_lora=true` and `lora_policy=packed_only`. Old files without
-these keys are treated as `packed_only`.
-
-With `lora_policy=packed_only`, regular ComfyUI LoRA nodes may still load keys
-without warnings, but patches targeting packed SVDInt4 Linear weights are not
-applied. Set `lora_policy=external_bypass` only when you intentionally want a
-separate user LoRA adapter path on top of the packed model. Dense `diff`/`set`
+quantized model and are not user LoRAs. Standard LoRA patches targeting packed
+SVDInt4 Linear weights are ignored by default before they enter ComfyUI's dense
+weight patch table. Enable `external_lora_bypass` only when you intentionally
+want a separate adapter path on top of the packed model. Dense `diff`/`set`
 weight patches are intentionally not supported for packed SVDInt4 weights.
-Repack the model only when the LoRA is meant to become part of the quantized
-base.
+Repack the model when the LoRA is meant to become part of the quantized base.
 
 ## Smoke Tests
 
@@ -214,9 +208,7 @@ Local load and single-layer CUDA forward:
 
 ```bash
 python custom_nodes/comfyui-svdint4/scripts/smoke_test.py \
-  --model ComfyUI/models/diffusion_models/your-model.safetensors \
-  --cache-mode auto \
-  --lora-policy metadata
+  --model ComfyUI/models/diffusion_models/your-model.safetensors
 ```
 
 Real denoise smoke on a running ComfyUI server with an API-format workflow:
@@ -278,7 +270,7 @@ The model dropdown is empty
 
 No valid SVDInt4 DiT files were found. Put the single-file assets in
 `ComfyUI/models/diffusion_models` and make sure their metadata contains
-`format=svdint4-dit-safetensors-v1`.
+`format=svdint4-dit-single-v2`.
 
 ComfyUI starts, but generation fails when sampling
 
