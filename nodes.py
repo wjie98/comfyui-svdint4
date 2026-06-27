@@ -75,8 +75,8 @@ class SVDInt4DiffusionModelLoader:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_diffusion_model"
-    CATEGORY = "model/loaders"
-    TITLE = "Load SVDInt4 Diffusion Model"
+    CATEGORY = "SVDInt4/loaders"
+    TITLE = "Load SVDInt4 DiT"
 
     def load_diffusion_model(self, unet_name: str):
         from .loader import load_svdint4_model
@@ -86,10 +86,8 @@ class SVDInt4DiffusionModelLoader:
 
 NODE_CLASS_MAPPINGS = {
     "SVDInt4DiffusionModelLoader": SVDInt4DiffusionModelLoader,
-    "SVDInt4ModelLoader": SVDInt4DiffusionModelLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SVDInt4DiffusionModelLoader": "Load SVDInt4 Diffusion Model",
-    "SVDInt4ModelLoader": "Load SVDInt4 Diffusion Model",
+    "SVDInt4DiffusionModelLoader": "Load SVDInt4 DiT",
 }

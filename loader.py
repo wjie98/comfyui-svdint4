@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
 SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
+WINDOWS_KERNEL_OPT_IN = "SVDINT4_ENABLE_EXPERIMENTAL_WINDOWS_KERNEL"
 
 
 def _kernel_install_hint() -> str:
@@ -27,6 +30,13 @@ def _kernel_install_hint() -> str:
 
 
 def _load_svdint4_linear():
+    if platform.system() == "Windows" and os.environ.get(WINDOWS_KERNEL_OPT_IN) != "1":
+        raise RuntimeError(
+            "The SVDInt4 CUDA kernel is disabled by default on Windows because it has not "
+            "completed production validation there and may trigger a driver-level crash. "
+            f"Set {WINDOWS_KERNEL_OPT_IN}=1 only if you are intentionally testing the "
+            "experimental Windows kernel path. Linux remains the supported runtime path."
+        )
     try:
         from svdint4.ops import svd_int4_linear
     except Exception as exc:

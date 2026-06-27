@@ -157,12 +157,18 @@ bernini-low.safetensors
 
 ## Nodes
 
-- `Load SVDInt4 Diffusion Model`
+- `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`.
 
 The loader infers the kernel compute dtype from the packed tensors. There is no
 separate model dtype setting.
+
+The node category is:
+
+```text
+SVDInt4/loaders
+```
 
 ## LoRA
 
@@ -188,6 +194,22 @@ python -m pip install -v --no-build-isolation \
 
 Make sure the CUDA toolkit used by `nvcc` matches your PyTorch CUDA version.
 For source builds, also make sure `--no-build-isolation` is present.
+
+Windows runtime
+
+The Windows CUDA kernel path is disabled by default. The plugin can still be
+installed and the loader node can enumerate SVDInt4 DiT files, but sampling will
+raise a clear error before launching the custom CUDA kernel. This is deliberate:
+the current Windows runtime path has not completed production validation and a
+bad custom kernel launch can crash the NVIDIA driver.
+
+For controlled testing only, opt in before starting ComfyUI:
+
+```powershell
+$env:SVDINT4_ENABLE_EXPERIMENTAL_WINDOWS_KERNEL = "1"
+```
+
+Linux is the supported runtime path for the SVDInt4 kernel in this release.
 
 `fatal error C1083: ... cusparse.h: No such file or directory`
 
