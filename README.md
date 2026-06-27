@@ -171,6 +171,9 @@ the GPU lazily when each Linear is first used. The loader still reports the
 full packed model size to ComfyUI so VRAM planning can unload other models
 before denoising starts.
 
+For diagnostics, the loader logs the base fp16 bytes, packed SVDInt4 bytes,
+reported model size, lazy GPU cache bytes, and cache release bytes.
+
 The node category is:
 
 ```text
@@ -179,12 +182,37 @@ SVDInt4/loaders
 
 ## LoRA
 
-Apply normal LoRA nodes after the SVDInt4 loader node. Extra LoRA is handled as
-a ComfyUI-side adapter/bypass path and does not require repacking the INT4
-model.
-
 The packed SVDQuant low-rank tensors inside the model are part of the base
-quantized model and are not user LoRAs.
+quantized model and are not user LoRAs. The loader intentionally hides dense
+SVDInt4 `.weight` placeholders from ComfyUI's normal LoRA patcher so external
+LoRAs are not fused into quantized base weights by accident.
+
+Extra LoRA should be applied as a separate bypass/adapter path outside the
+packed SVDInt4 base. Repack the model only when the LoRA is meant to become
+part of the quantized base.
+
+## Smoke Tests
+
+Local load and single-layer CUDA forward:
+
+```bash
+python custom_nodes/comfyui-svdint4/scripts/smoke_test.py \
+  --model ComfyUI/models/diffusion_models/your-model.safetensors
+```
+
+Real denoise smoke on a running ComfyUI server with an API-format workflow:
+
+```bash
+python custom_nodes/comfyui-svdint4/scripts/smoke_test.py \
+  --workflow smoke-workflow-api.json \
+  --server http://127.0.0.1:8188 \
+  --steps 3
+```
+
+On Windows/Turing, run both tests after installing the kernel in the same
+environment that starts ComfyUI. The first test catches loader/kernel import
+and single-kernel issues; the workflow test catches DynamicVRAM, high/low DiT,
+VAE/text encoder, and scheduler integration issues.
 
 ## Troubleshooting
 
