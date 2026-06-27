@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "svdint4-kernel"
 version = "0.1.0"
-description = "Minimal SVDQuant INT4 GEMM + fused SVD LoRA PyTorch extension"
+description = "Minimal SVDQuant INT4 GEMM + SVD correction PyTorch extension"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

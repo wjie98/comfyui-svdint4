@@ -72,7 +72,7 @@ def run_local_load_forward(
     comfy_root: Path,
     model_path: Path,
     skip_forward: bool,
-    external_lora_bypass: bool,
+    enable_lora_adapters: bool,
 ) -> None:
     sys.path.insert(0, str(comfy_root))
     sys.path.insert(0, str(comfy_root / "custom_nodes" / "comfyui-svdint4"))
@@ -92,7 +92,7 @@ def run_local_load_forward(
         print("cuda unavailable")
 
     t0 = time.perf_counter()
-    patcher = loader.load_svdint4_model(model_path, external_lora_bypass=external_lora_bypass)
+    patcher = loader.load_svdint4_model(model_path, enable_lora_adapters=enable_lora_adapters)
     t1 = time.perf_counter()
     modules = [(name, module) for name, module in patcher.model.named_modules() if getattr(module, "is_svdint4", False)]
     print(f"loaded patcher in {t1 - t0:.3f}s; svdint4 layers: {len(modules)}; reported size: {patcher.model_size() / 1024**2:.2f} MB")
@@ -133,7 +133,7 @@ def main() -> None:
     parser.add_argument("--comfy-root", type=Path, default=_default_comfy_root())
     parser.add_argument("--model", type=Path, help="SVDInt4 .safetensors file for local load/forward smoke.")
     parser.add_argument("--skip-forward", action="store_true", help="Only load the model locally; do not run a CUDA layer forward.")
-    parser.add_argument("--external-lora-bypass", action="store_true")
+    parser.add_argument("--enable-lora-adapters", action="store_true")
     parser.add_argument("--workflow", type=Path, help="ComfyUI API-format workflow JSON for a real denoise smoke.")
     parser.add_argument("--server", default="http://127.0.0.1:8188", help="Running ComfyUI server URL for --workflow.")
     parser.add_argument("--steps", type=int, help="Patch every workflow input named 'steps' to this value.")
@@ -145,7 +145,7 @@ def main() -> None:
         parser.error("provide --model, --workflow, or both")
 
     if args.model is not None:
-        run_local_load_forward(args.comfy_root, args.model, args.skip_forward, args.external_lora_bypass)
+        run_local_load_forward(args.comfy_root, args.model, args.skip_forward, args.enable_lora_adapters)
 
     if args.workflow is not None:
         try:

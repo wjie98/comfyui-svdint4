@@ -1,7 +1,7 @@
 svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
 W4A4/SVDQuant CUDA kernel path.
 
-Only the INT4 GEMM, activation quantization, and fused SVD LoRA path are
+Only the INT4 GEMM, activation quantization, and SVD correction path are
 exposed here. Model wrappers, attention/RoPE/RMSNorm fusion, W8A8, AWQ,
 NVFP4, cache logic, and pipeline integrations are intentionally omitted.
 
@@ -13,5 +13,5 @@ Nunchaku is licensed under the Apache License, Version 2.0. A copy of the
 original license text is kept in LICENSES/nunchaku-LICENCE.txt.
 
 The derived subset has been reduced and flattened to the files required for
-INT4 GEMM, activation quantization, and fused SVD LoRA dispatch. The package
+INT4 GEMM, activation quantization, and SVD correction dispatch. The package
 build no longer depends on a sibling nunchaku checkout.

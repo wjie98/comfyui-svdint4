@@ -9,13 +9,14 @@ import torch
 import torch.nn as nn
 from safetensors import safe_open
 
+import comfy.lora
 import comfy.ops
 import comfy.sd
 import comfy.weight_adapter
 from comfy.patcher_extension import CallbacksMP
 
 try:
-    from comfy.quant_ops import QuantizedLayout, QuantizedTensor, register_layout_class
+    from comfy.quant_ops import QuantizedLayout, QuantizedTensor, register_layout_class, register_layout_op
     _HAS_COMFY_QUANTIZED_TENSOR = issubclass(QuantizedTensor, torch.Tensor)
 except Exception:
     QuantizedLayout = object
@@ -24,6 +25,11 @@ except Exception:
 
     def register_layout_class(name, cls):
         return None
+
+    def register_layout_op(torch_op, layout_cls):
+        def decorator(func):
+            return func
+        return decorator
 
 
 LOG = logging.getLogger("comfyui-svdint4")
@@ -157,6 +163,7 @@ class SVDInt4PackedParams:
     has_smooth: bool = False
     has_bias_packed: bool = False
     name: str = ""
+    transposed: bool = False
 
     def _tensor_fields(self) -> tuple[str, ...]:
         return ("wscales", "svd_down", "svd_up", "smooth", "bias_packed")
@@ -223,6 +230,78 @@ class SVDInt4PackedLayout(QuantizedLayout):
 
 if _HAS_COMFY_QUANTIZED_TENSOR:
     register_layout_class(SVDINT4_LAYOUT_NAME, SVDInt4PackedLayout)
+
+
+def _svdint4_forward(input_tensor: torch.Tensor, weight_qt, bias: torch.Tensor | None = None) -> torch.Tensor:
+    if isinstance(input_tensor, QuantizedTensor):
+        input_tensor = input_tensor.dequantize()
+    _validate_cuda_kernel_runtime(input_tensor)
+    params = weight_qt._params
+    out_features = params.orig_shape[1] if params.transposed else params.orig_shape[0]
+    svd_int4_linear = _load_svdint4_linear()
+    out = svd_int4_linear(
+        input_tensor,
+        weight_qt._qdata,
+        params.wscales,
+        params.svd_down,
+        params.svd_up,
+        smooth_packed=params.smooth if params.has_smooth else None,
+        bias_packed=params.bias_packed if params.has_bias_packed else None,
+        out_features=out_features,
+    )
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+@register_layout_op(torch.ops.aten.linear.default, SVDInt4PackedLayout)
+def _handle_svdint4_linear(qt, args, kwargs):
+    input_tensor, weight = args[0], args[1]
+    bias = args[2] if len(args) > 2 else kwargs.get("bias")
+    if not isinstance(weight, QuantizedTensor):
+        return torch.nn.functional.linear(input_tensor, weight, bias)
+    if weight._params.transposed:
+        raise RuntimeError("SVDInt4 F.linear expects the stored, non-transposed packed weight")
+    return _svdint4_forward(input_tensor, weight, bias)
+
+
+@register_layout_op(torch.ops.aten.t.default, SVDInt4PackedLayout)
+def _handle_svdint4_t(qt, args, kwargs):
+    input_tensor = args[0]
+    if not isinstance(input_tensor, QuantizedTensor):
+        return torch.ops.aten.t.default(*args, **kwargs)
+    old = input_tensor._params
+    new_params = dataclasses.replace(
+        old,
+        orig_shape=(old.orig_shape[1], old.orig_shape[0]),
+        transposed=not old.transposed,
+    )
+    return QuantizedTensor(input_tensor._qdata, SVDINT4_LAYOUT_NAME, new_params)
+
+
+def _resolve_svdint4_rhs(rhs) -> None:
+    if not isinstance(rhs, QuantizedTensor):
+        raise TypeError("SVDInt4 RHS must be a QuantizedTensor")
+    if not rhs._params.transposed:
+        raise RuntimeError("SVDInt4 GEMM expects RHS to be W.T; use F.linear(x, W) or mm(x, W.t())")
+
+
+@register_layout_op(torch.ops.aten.mm.default, SVDInt4PackedLayout)
+def _handle_svdint4_mm(qt, args, kwargs):
+    a, b = args[0], args[1]
+    if not isinstance(b, QuantizedTensor):
+        return torch.mm(a, b)
+    _resolve_svdint4_rhs(b)
+    return _svdint4_forward(a, b, bias=None)
+
+
+@register_layout_op(torch.ops.aten.addmm.default, SVDInt4PackedLayout)
+def _handle_svdint4_addmm(qt, args, kwargs):
+    bias, a, b = args[0], args[1], args[2]
+    if not isinstance(b, QuantizedTensor):
+        return torch.addmm(bias, a, b)
+    _resolve_svdint4_rhs(b)
+    return _svdint4_forward(a, b, bias=bias)
 
 
 class SVDInt4PackedTensor:
@@ -307,8 +386,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = None
         self.packed_weight: SVDInt4PackedTensor | None = None
-        self._svdint4_lora_patches = []
-        self._svdint4_lora_warnings: set[str] = set()
+        self._svdint4_adapter_lora_overlays = []
+        self._svdint4_adapter_lora_warnings: set[str] = set()
 
     def _load_from_state_dict(
         self,
@@ -400,37 +479,37 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             "bias_packed": params.bias_packed if params.has_bias_packed else None,
         }
 
-    def _warn_lora_once(self, code: str, message: str, *args) -> None:
-        if code in self._svdint4_lora_warnings:
+    def _warn_adapter_lora_once(self, code: str, message: str, *args) -> None:
+        if code in self._svdint4_adapter_lora_warnings:
             return
-        self._svdint4_lora_warnings.add(code)
+        self._svdint4_adapter_lora_warnings.add(code)
         LOG.warning(message, *args)
 
-    def _apply_lora_bypass(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        patches = self._svdint4_lora_patches
+    def _apply_lora_adapters(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        patches = self._svdint4_adapter_lora_overlays
         if not patches:
             return out
 
         result = out
         for strength_patch, patch_data, strength_model, offset, function in patches:
             if offset is not None:
-                self._warn_lora_once(
+                self._warn_adapter_lora_once(
                     "lora_offset",
-                    "SVDInt4 bypass LoRA skipped %s: offset patches are not supported",
+                    "SVDInt4 adapter LoRA overlay skipped %s: offset patches are not supported",
                     getattr(self, "packed_name", "<unknown>"),
                 )
                 continue
             if strength_model != 1.0:
-                self._warn_lora_once(
+                self._warn_adapter_lora_once(
                     "lora_strength_model",
-                    "SVDInt4 bypass LoRA skipped %s: strength_model != 1 is not supported",
+                    "SVDInt4 adapter LoRA overlay skipped %s: strength_model != 1 is not supported",
                     getattr(self, "packed_name", "<unknown>"),
                 )
                 continue
             if not isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
-                self._warn_lora_once(
+                self._warn_adapter_lora_once(
                     "lora_non_adapter",
-                    "SVDInt4 bypass LoRA skipped %s: only adapter LoRA patches are supported",
+                    "SVDInt4 adapter LoRA overlay skipped %s: only adapter LoRA patches are supported",
                     getattr(self, "packed_name", "<unknown>"),
                 )
                 continue
@@ -459,9 +538,9 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                     delta = function(delta)
                 result = patch_data.g(result + delta.to(dtype=result.dtype))
             except Exception as exc:
-                self._warn_lora_once(
+                self._warn_adapter_lora_once(
                     "lora_failed",
-                    "SVDInt4 bypass LoRA failed for %s and was skipped: %s",
+                    "SVDInt4 adapter LoRA overlay failed for %s and was skipped: %s",
                     getattr(self, "packed_name", "<unknown>"),
                     exc,
                 )
@@ -478,36 +557,28 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             raise RuntimeError("SVDInt4 Linear requires CUDA input tensors")
 
         _validate_cuda_kernel_runtime(input)
-        svd_int4_linear = _load_svdint4_linear()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
-        saved_weight_function = self.weight_function
-        self.weight_function = []
-        weight = None
-        offload_stream = None
-        try:
-            weight, _, offload_stream = comfy.ops.cast_bias_weight(
-                self,
-                input=x,
-                dtype=self.compute_dtype,
-                offloadable=True,
-            )
-            tensors = self._packed_tensors_from_weight(weight)
-            out = svd_int4_linear(
-                x,
-                tensors["qweight"],
-                tensors["wscales"],
-                tensors["svd_down"],
-                tensors["svd_up"],
-                smooth_packed=tensors["smooth"],
-                bias_packed=tensors["bias_packed"],
-                out_features=self.out_features,
-            )
-        finally:
-            self.weight_function = saved_weight_function
-            if weight is not None:
-                comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
-        out = self._apply_lora_bypass(x, out)
+        if len(self.weight_function) == 0 and self.weight is not None and self.weight.device == x.device:
+            out = torch.nn.functional.linear(x, self.weight, None)
+        else:
+            saved_weight_function = self.weight_function
+            self.weight_function = []
+            weight = None
+            offload_stream = None
+            try:
+                weight, _, offload_stream = comfy.ops.cast_bias_weight(
+                    self,
+                    input=x,
+                    dtype=self.compute_dtype,
+                    offloadable=True,
+                )
+                out = torch.nn.functional.linear(x, weight, None)
+            finally:
+                self.weight_function = saved_weight_function
+                if weight is not None:
+                    comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
+        out = self._apply_lora_adapters(x, out)
         return out if out.dtype == original_dtype else out.to(original_dtype)
 
 
@@ -590,15 +661,15 @@ def _install_svdint4_patch_filter() -> None:
 
         passthrough = {}
         handled = set()
-        external_bypass = bool(getattr(self.model, "_svdint4_external_lora_bypass", False))
-        pending = getattr(self.model, "_svdint4_pending_lora_patches", None)
+        enable_lora_adapters = bool(getattr(self.model, "_svdint4_enable_lora_adapters", False))
+        pending = getattr(self.model, "_svdint4_pending_adapter_lora_overlays", None)
         if pending is None:
             pending = {}
-            self.model._svdint4_pending_lora_patches = pending
+            self.model._svdint4_pending_adapter_lora_overlays = pending
 
-        ignored = int(getattr(self.model, "_svdint4_ignored_lora_patch_count", 0))
-        bypassed = int(getattr(self.model, "_svdint4_bypass_lora_patch_count", 0))
-        skipped = int(getattr(self.model, "_svdint4_skipped_lora_patch_count", 0))
+        ignored = int(getattr(self.model, "_svdint4_ignored_adapter_lora_patch_count", 0))
+        overlaid = int(getattr(self.model, "_svdint4_adapter_lora_overlay_count", 0))
+        skipped = int(getattr(self.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
 
         for key, patch_data in patches.items():
             weight_key = _patch_key_name(key)
@@ -608,20 +679,20 @@ def _install_svdint4_patch_filter() -> None:
 
             handled.add(key)
             offset, function = _patch_key_offset_function(key)
-            if external_bypass and isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+            if enable_lora_adapters and isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
                 pending.setdefault(weight_key, []).append((strength_patch, patch_data, strength_model, offset, function))
-                bypassed += 1
+                overlaid += 1
             else:
-                if external_bypass:
+                if enable_lora_adapters:
                     skipped += 1
                 else:
                     ignored += 1
 
         patched = set(add_patches(self, passthrough, strength_patch, strength_model)) if passthrough else set()
         if handled:
-            self.model._svdint4_ignored_lora_patch_count = ignored
-            self.model._svdint4_bypass_lora_patch_count = bypassed
-            self.model._svdint4_skipped_lora_patch_count = skipped
+            self.model._svdint4_ignored_adapter_lora_patch_count = ignored
+            self.model._svdint4_adapter_lora_overlay_count = overlaid
+            self.model._svdint4_unsupported_adapter_lora_patch_count = skipped
             self.patches_uuid = uuid.uuid4()
             patched.update(handled)
         return list(patched)
@@ -630,39 +701,65 @@ def _install_svdint4_patch_filter() -> None:
     comfy.model_patcher.ModelPatcher.add_patches = svdint4_add_patches
 
 
-def _attach_lora_bypass_patches(model_patcher) -> None:
-    external_lora_bypass = bool(getattr(model_patcher.model, "_svdint4_external_lora_bypass", False))
+def _install_svdint4_lora_key_map() -> None:
+    model_lora_keys_unet = comfy.lora.model_lora_keys_unet
+    if getattr(model_lora_keys_unet, "_svdint4_key_map_installed", False):
+        return
+
+    def svdint4_model_lora_keys_unet(model, key_map={}):
+        key_map = model_lora_keys_unet(model, key_map)
+        packed_weight_keys = getattr(model, "_svdint4_weight_keys", None)
+        if not packed_weight_keys:
+            return key_map
+
+        for key in packed_weight_keys:
+            if not key.endswith(".weight"):
+                continue
+            base = key[:-len(".weight")]
+            key_map[base] = key
+            if base.startswith("diffusion_model."):
+                suffix = base[len("diffusion_model."):]
+                key_map[suffix] = key
+                key_map[f"lora_unet_{suffix.replace('.', '_')}"] = key
+        return key_map
+
+    svdint4_model_lora_keys_unet._svdint4_key_map_installed = True
+    comfy.lora.model_lora_keys_unet = svdint4_model_lora_keys_unet
+
+
+def _attach_lora_adapter_overlays(model_patcher) -> None:
+    enable_lora_adapters = bool(getattr(model_patcher.model, "_svdint4_enable_lora_adapters", False))
     adapter_count = 0
-    pending_patches = getattr(model_patcher.model, "_svdint4_pending_lora_patches", {}) or {}
+    pending_overlays = getattr(model_patcher.model, "_svdint4_pending_adapter_lora_overlays", {}) or {}
     for name, module in model_patcher.model.named_modules():
         if not getattr(module, "is_svdint4", False):
             continue
 
-        bypass_patches = pending_patches.get(f"{name}.weight", [])
-        module._svdint4_lora_patches = bypass_patches if external_lora_bypass else []
-        adapter_count += len(bypass_patches)
+        overlays = pending_overlays.get(f"{name}.weight", [])
+        module._svdint4_adapter_lora_overlays = overlays if enable_lora_adapters else []
+        adapter_count += len(overlays)
 
-    if not external_lora_bypass:
-        ignored_count = int(getattr(model_patcher.model, "_svdint4_ignored_lora_patch_count", 0))
+    if not enable_lora_adapters:
+        ignored_count = int(getattr(model_patcher.model, "_svdint4_ignored_adapter_lora_patch_count", 0))
         if ignored_count:
             LOG.info(
-                "SVDInt4 ignored %d adapter patch(es) targeting packed Linear weights; enable external_lora_bypass to run them as fp16 forward bypass paths",
+                "SVDInt4 ignored %d adapter LoRA patch(es) targeting packed Linear weights; enable_lora_adapters to run them as fp16 adapter LoRA overlays",
                 ignored_count,
             )
         return
 
     if adapter_count:
-        LOG.info("SVDInt4 attached %d LoRA adapter patches as forward bypass paths", adapter_count)
-    skipped_count = int(getattr(model_patcher.model, "_svdint4_skipped_lora_patch_count", 0))
+        LOG.info("SVDInt4 attached %d adapter LoRA overlay patch(es)", adapter_count)
+    skipped_count = int(getattr(model_patcher.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
     if skipped_count:
         LOG.warning(
-            "SVDInt4 ignored %d non-adapter LoRA patches; dense diff/set patches are not supported for packed weights",
+            "SVDInt4 ignored %d non-adapter patch(es) targeting packed Linear weights; dense diff/set patches are unsupported for packed weights",
             skipped_count,
         )
 
 
 def _after_model_load(model_patcher, *_) -> None:
-    _attach_lora_bypass_patches(model_patcher)
+    _attach_lora_adapter_overlays(model_patcher)
     root = model_patcher.model
     LOG.info(
         "SVDInt4 load state: reported %.2f MB, loaded %.2f MB, packed %.2f MB, visible %.2f MB",
@@ -675,22 +772,23 @@ def _after_model_load(model_patcher, *_) -> None:
 
 def _load_svdint4_model_cached(
     model_path: str | Path,
-    external_lora_bypass: bool = False,
-    disable_dynamic: bool = False,
+    enable_lora_adapters: bool = False,
+    disable_dynamic: bool = True,
 ):
     return load_svdint4_model(
         model_path,
         disable_dynamic=disable_dynamic,
-        external_lora_bypass=external_lora_bypass,
+        enable_lora_adapters=enable_lora_adapters,
     )
 
 
 def load_svdint4_model(
     model_path: str | Path,
-    disable_dynamic: bool = False,
-    external_lora_bypass: bool = False,
+    disable_dynamic: bool = True,
+    enable_lora_adapters: bool = False,
 ):
     _install_svdint4_patch_filter()
+    _install_svdint4_lora_key_map()
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
@@ -713,11 +811,11 @@ def load_svdint4_model(
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.model._svdint4_packed_bytes = packed_bytes
     model.model._svdint4_packed_state_bytes = packed_state_bytes
-    model.model._svdint4_external_lora_bypass = bool(external_lora_bypass)
-    model.model._svdint4_pending_lora_patches = {}
-    model.model._svdint4_ignored_lora_patch_count = 0
-    model.model._svdint4_bypass_lora_patch_count = 0
-    model.model._svdint4_skipped_lora_patch_count = 0
+    model.model._svdint4_enable_lora_adapters = bool(enable_lora_adapters)
+    model.model._svdint4_pending_adapter_lora_overlays = {}
+    model.model._svdint4_ignored_adapter_lora_patch_count = 0
+    model.model._svdint4_adapter_lora_overlay_count = 0
+    model.model._svdint4_unsupported_adapter_lora_patch_count = 0
     model.model._svdint4_metadata = metadata
     packed_weight_keys = set()
     for name, module in model.model.named_modules():
@@ -734,9 +832,11 @@ def load_svdint4_model(
         _mb(model.size),
     )
     LOG.info(
-        "SVDInt4 external LoRA bypass: %s; dense diff/set LoRA patches are unsupported for packed weights.",
-        model.model._svdint4_external_lora_bypass,
+        "SVDInt4 adapter LoRA overlay: %s; dense diff/set patches are unsupported for packed weights.",
+        "enabled" if model.model._svdint4_enable_lora_adapters else "disabled",
     )
+    if disable_dynamic:
+        LOG.info("SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; DynamicVRAM staging is disabled for this model.")
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
-    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), external_lora_bypass))
+    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters))
     return model

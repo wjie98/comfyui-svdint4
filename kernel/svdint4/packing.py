@@ -9,8 +9,7 @@ SVDINT4_METADATA_CONTRACT_VERSION = "1"
 SVDINT4_DEFAULT_METADATA = {
     "format": "svdint4-dit-safetensors-v1",
     "svdint4_contract_version": SVDINT4_METADATA_CONTRACT_VERSION,
-    "has_internal_svd_lora": "true",
-    "lora_policy": "packed_only",
+    "has_svd_correction": "true",
 }
 
 
@@ -137,7 +136,7 @@ def pack_bias(bias: torch.Tensor, n_pad: int | None = None) -> torch.Tensor:
 
 def _pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
     if weight.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"low-rank weight must be fp16/bf16, got {weight.dtype}")
+        raise TypeError(f"SVD correction weight must be fp16/bf16, got {weight.dtype}")
 
     lane_n, lane_k = 1, 2
     n_pack_size, k_pack_size = 2, 2

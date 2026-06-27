@@ -69,11 +69,11 @@ class SVDInt4DiffusionModelLoader:
                         )
                     },
                 ),
-                "external_lora_bypass": (
+                "enable_lora_adapters": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Run standard adapter LoRAs as fp16 forward bypass paths instead of ignoring packed Linear LoRA patches.",
+                        "tooltip": "Run compatible adapter LoRAs as fp16 overlays on top of packed SVDInt4 Linear layers.",
                     },
                 ),
             }
@@ -88,11 +88,11 @@ class SVDInt4DiffusionModelLoader:
     def load_diffusion_model(
         self,
         unet_name: str,
-        external_lora_bypass: bool = False,
+        enable_lora_adapters: bool = False,
     ):
         from .loader import load_svdint4_model
 
-        return (load_svdint4_model(_resolve_model_path(unet_name), external_lora_bypass=external_lora_bypass),)
+        return (load_svdint4_model(_resolve_model_path(unet_name), enable_lora_adapters=enable_lora_adapters),)
 
 
 NODE_CLASS_MAPPINGS = {

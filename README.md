@@ -3,8 +3,8 @@
 ComfyUI custom node for loading SVDInt4-quantized Wan/Bernini DiT models.
 
 The plugin keeps the base model in packed INT4 form and runs the built-in
-SVDQuant low-rank branch inside the CUDA kernel. Regular user LoRAs remain
-normal ComfyUI LoRAs and should be applied after the SVDInt4 loader node.
+SVD residual correction tensors inside the CUDA kernel. User LoRAs are separate
+adapter overlays; to make a LoRA part of the quantized base, repack the model.
 
 ## Requirements
 
@@ -114,7 +114,7 @@ tensors:
 ```
 
 Only the `format` metadata is required in the weight file. Keep provenance,
-calibration notes, source paths, and experiment policy in a sidecar JSON if you
+calibration notes, source paths, and experiment notes in a sidecar JSON if you
 need them.
 
 The node scans ComfyUI's `diffusion_models` paths and only shows supported
@@ -146,7 +146,7 @@ Convert each branch into one `.safetensors` file before using it in ComfyUI:
 1. Start with all tensors from `kept_fp16.safetensors`.
 2. Read every `block_XX.safetensors` listed by `manifest.json`.
 3. Copy packed tensors into the same output file.
-4. Rename old internal low-rank keys:
+4. Rename old SVD correction tensor keys:
    - `.lora_down` -> `.svd_down`
    - `.lora_up` -> `.svd_up`
 5. Save with minimal metadata: `format=svdint4-dit-single-v2`.
@@ -173,18 +173,23 @@ The script writes original metadata and basic provenance to
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`. The node exposes one policy option:
-  `external_lora_bypass`.
+  returns a ComfyUI `MODEL`. The node exposes one adapter option:
+  `enable_lora_adapters`.
 
 The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
-Packed SVDInt4 weights are represented internally as ComfyUI QuantizedTensor
+Packed SVDInt4 weights are represented as ComfyUI QuantizedTensor
 weights so ComfyUI can account for and move their qweight, scales, smooth
-factors, and SVD tensors together. The public `state_dict()` does not expose
+factors, and SVD correction tensors together. The public `state_dict()` does not expose
 packed weights as normal `.weight` tensors, so standard ComfyUI LoRA patching
 does not accidentally treat them as dense fp16 weights.
+
+SVDInt4 DiT weights are loaded through ComfyUI's resident ModelPatcher path by
+default. This avoids DynamicVRAM staging every packed Linear layer during the
+first denoise step, which is usually slower than one full packed-branch upload
+for 480p Wan/Bernini workflows on 11GB or larger NVIDIA cards.
 
 The node category is:
 
@@ -194,13 +199,14 @@ SVDInt4/loaders
 
 ## LoRA
 
-The packed SVDQuant low-rank tensors inside the model are part of the base
-quantized model and are not user LoRAs. Standard LoRA patches targeting packed
-SVDInt4 Linear weights are ignored by default before they enter ComfyUI's dense
-weight patch table. Enable `external_lora_bypass` only when you intentionally
-want a separate adapter path on top of the packed model. Dense `diff`/`set`
+The packed SVD residual correction tensors inside the model are part of the
+base quantized model and are not LoRA adapters. Standard LoRA patches targeting
+packed SVDInt4 Linear weights are kept out of ComfyUI's dense weight patch
+table. By default those adapter patches are ignored. Enable
+`enable_lora_adapters` only when you intentionally want compatible adapter
+LoRAs to run as fp16 overlays on top of the packed model. Dense `diff`/`set`
 weight patches are intentionally not supported for packed SVDInt4 weights.
-Repack the model when the LoRA is meant to become part of the quantized base.
+Repack the model when a LoRA is meant to become part of the quantized base.
 
 ## Smoke Tests
 
