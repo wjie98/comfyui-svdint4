@@ -75,15 +75,14 @@ def _validate_metadata(metadata: dict[str, str], model_path: Path) -> None:
         )
 
 
-def _collect_packed_layers(model_path: Path) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
+def _collect_packed_layers_from_handle(handle) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
     layers: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {}
-    with safe_open(model_path, framework="pt", device="cpu") as handle:
-        for key in handle.keys():
-            split = _split_packed_key(key)
-            if split is None:
-                continue
-            name, field = split
-            layers.setdefault(name, {})[field] = (key, tuple(handle.get_slice(key).get_shape()))
+    for key in handle.keys():
+        split = _split_packed_key(key)
+        if split is None:
+            continue
+        name, field = split
+        layers.setdefault(name, {})[field] = (key, tuple(handle.get_slice(key).get_shape()))
 
     valid: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {}
     for name, fields in sorted(layers.items()):
@@ -95,6 +94,11 @@ def _collect_packed_layers(model_path: Path) -> dict[str, dict[str, tuple[str, t
     return valid
 
 
+def _collect_packed_layers(model_path: Path) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
+    with safe_open(model_path, framework="pt", device="cpu") as handle:
+        return _collect_packed_layers_from_handle(handle)
+
+
 def _load_layer_tensors(model_path: Path, name: str) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(model_path, framework="pt", device="cpu") as handle:
@@ -102,7 +106,7 @@ def _load_layer_tensors(model_path: Path, name: str) -> dict[str, torch.Tensor]:
         for field in PACKED_FIELDS:
             key = f"{name}.{field}"
             if key in keys:
-                tensors[field] = handle.get_tensor(key)
+                tensors[field] = _owned_cpu_tensor(handle.get_tensor(key), _packed_tensor_dtype(field))
 
     missing = REQUIRED_FIELDS - tensors.keys()
     if missing:
@@ -110,17 +114,22 @@ def _load_layer_tensors(model_path: Path, name: str) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _optional_float(value: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor | None:
-    if value is None:
-        return None
-    if value.dtype in (torch.float16, torch.bfloat16, torch.float32):
-        return value.to(dtype).contiguous()
-    return value.contiguous()
+def _owned_cpu_tensor(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
+    if dtype is not None and value.dtype != dtype:
+        value = value.to(dtype)
+    return value.contiguous().clone()
+
+
+def _packed_tensor_dtype(field: str) -> torch.dtype | None:
+    if field in {"wscales", "smooth", "svd_down", "svd_up", "bias_packed"}:
+        return COMPUTE_DTYPE
+    return None
 
 
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
     model_path: Path | None = None
     packed_layer_names: frozenset[str] = frozenset()
+    packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
         torch.nn.Module.__init__(self)
@@ -185,18 +194,20 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
     def _load_svdint4(self, name: str) -> None:
         if self.model_path is None:
             raise RuntimeError("SVDInt4 Linear missing model_path")
-        tensors = _load_layer_tensors(self.model_path, name)
+        tensors = self.packed_layer_tensors.pop(name, None)
+        if tensors is None:
+            tensors = _load_layer_tensors(self.model_path, name)
         self.is_svdint4 = True
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = name
         self.weight = torch.empty((self.out_features, self.in_features), device="meta", dtype=COMPUTE_DTYPE)
         self.bias = torch.empty((self.out_features,), device="meta", dtype=COMPUTE_DTYPE) if "bias_packed" in tensors else None
         self.register_buffer("qweight", tensors["qweight"].contiguous())
-        self.register_buffer("wscales", tensors["wscales"].to(COMPUTE_DTYPE).contiguous())
-        self.register_buffer("smooth", _optional_float(tensors.get("smooth"), COMPUTE_DTYPE))
-        self.register_buffer("svd_down", tensors["svd_down"].to(COMPUTE_DTYPE).contiguous())
-        self.register_buffer("svd_up", tensors["svd_up"].to(COMPUTE_DTYPE).contiguous())
-        self.register_buffer("bias_packed", _optional_float(tensors.get("bias_packed"), COMPUTE_DTYPE))
+        self.register_buffer("wscales", tensors["wscales"].contiguous())
+        self.register_buffer("smooth", tensors.get("smooth"))
+        self.register_buffer("svd_down", tensors["svd_down"].contiguous())
+        self.register_buffer("svd_up", tensors["svd_up"].contiguous())
+        self.register_buffer("bias_packed", tensors.get("bias_packed"))
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         if not self.is_svdint4:
@@ -239,51 +250,74 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
 
 
 class SVDInt4Ops(comfy.ops.manual_cast):
-    def __init__(self, model_path: str | Path, packed_layer_names: set[str]):
+    def __init__(self, model_path: str | Path, packed_layer_tensors: dict[str, dict[str, torch.Tensor]]):
         self.Linear = type(
             "Linear",
             (SVDInt4LinearOp,),
-            {"model_path": Path(model_path), "packed_layer_names": frozenset(packed_layer_names)},
+            {
+                "model_path": Path(model_path),
+                "packed_layer_names": frozenset(packed_layer_tensors),
+                "packed_layer_tensors": packed_layer_tensors,
+            },
         )
 
 
-def build_loader_state_dict(model_path: str | Path) -> tuple[dict[str, torch.Tensor], dict[str, str], set[str]]:
+def build_loader_state_dict(
+    model_path: str | Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, str], dict[str, dict[str, torch.Tensor]]]:
     model_path = Path(model_path)
-    metadata = _model_metadata(model_path)
-    _validate_metadata(metadata, model_path)
-    packed_layers = _collect_packed_layers(model_path)
-    if not packed_layers:
-        raise ValueError(f"{model_path} does not contain any complete SVDInt4 Linear layers")
     state_dict: dict[str, torch.Tensor] = {}
+    packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
     with safe_open(model_path, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+        _validate_metadata(metadata, model_path)
+        packed_layers = _collect_packed_layers_from_handle(handle)
+        if not packed_layers:
+            raise ValueError(f"{model_path} does not contain any complete SVDInt4 Linear layers")
+
         for key in handle.keys():
             split = _split_packed_key(key)
             if split is not None:
                 continue
-            state_dict[key] = handle.get_tensor(key)
+            state_dict[key] = _owned_cpu_tensor(handle.get_tensor(key))
 
-    for name, fields in packed_layers.items():
-        qshape = fields["qweight"][1]
-        out_features = int(qshape[0])
-        in_features = int(qshape[1] * 2)
-        state_dict[f"{name}.weight"] = torch.empty((out_features, in_features), device="meta", dtype=torch.float16)
-        if "bias_packed" in fields:
-            state_dict[f"{name}.bias"] = torch.empty((out_features,), device="meta", dtype=torch.float16)
+        for name, fields in packed_layers.items():
+            tensors: dict[str, torch.Tensor] = {}
+            for field, (key, _) in fields.items():
+                tensors[field] = _owned_cpu_tensor(handle.get_tensor(key), _packed_tensor_dtype(field))
+            packed_layer_tensors[name] = tensors
 
-    LOG.info("SVDInt4 loaded %d packed Linear layers from %s", len(packed_layers), model_path)
-    return state_dict, metadata, set(packed_layers)
+            qshape = fields["qweight"][1]
+            out_features = int(qshape[0])
+            in_features = int(qshape[1] * 2)
+            state_dict[f"{name}.weight"] = torch.empty((out_features, in_features), device="meta", dtype=torch.float16)
+            if "bias_packed" in fields:
+                state_dict[f"{name}.bias"] = torch.empty((out_features,), device="meta", dtype=torch.float16)
+
+    LOG.info(
+        "SVDInt4 loaded %d packed Linear layers from one safetensors open: %s",
+        len(packed_layer_tensors),
+        model_path,
+    )
+    return state_dict, metadata, packed_layer_tensors
 
 
 def load_svdint4_model(model_path: str | Path, disable_dynamic: bool = False):
     model_path = Path(model_path)
-    state_dict, metadata, packed_layer_names = build_loader_state_dict(model_path)
+    state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,
-        model_options={"custom_operations": SVDInt4Ops(model_path, packed_layer_names)},
+        model_options={"custom_operations": SVDInt4Ops(model_path, packed_layer_tensors)},
         metadata=metadata,
         disable_dynamic=disable_dynamic,
     )
+    if packed_layer_tensors:
+        LOG.warning(
+            "SVDInt4 model load left %d packed Linear layers unused; clearing them to release CPU memory",
+            len(packed_layer_tensors),
+        )
+        packed_layer_tensors.clear()
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.cached_patcher_init = (load_svdint4_model, (str(model_path),))
