@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -18,7 +16,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
 SUPPORTED_FORMATS = {"svdint4-dit-safetensors-v1"}
-CUDA_SYNC_ENV = "SVDINT4_CUDA_SYNC"
+COMPUTE_DTYPE = torch.float16
 
 
 def _kernel_install_hint() -> str:
@@ -40,18 +38,11 @@ def _load_svdint4_linear():
     return svd_int4_linear
 
 
-def _validate_cuda_kernel_runtime(x: torch.Tensor, compute_dtype: torch.dtype) -> None:
+def _validate_cuda_kernel_runtime(x: torch.Tensor) -> None:
     major, minor = torch.cuda.get_device_capability(x.device)
     sm = major * 10 + minor
     if sm < 75:
         raise RuntimeError(f"SVDInt4 requires NVIDIA Turing/sm75 or newer, got sm{sm}")
-    if compute_dtype == torch.bfloat16 and sm < 80:
-        raise RuntimeError("SVDInt4 bfloat16 kernels require Ampere/sm80 or newer")
-
-
-def _sync_if_requested(x: torch.Tensor) -> None:
-    if os.environ.get(CUDA_SYNC_ENV) == "1":
-        torch.cuda.synchronize(x.device)
 
 
 def _split_packed_key(key: str) -> tuple[str, str] | None:
@@ -127,14 +118,6 @@ def _optional_float(value: torch.Tensor | None, dtype: torch.dtype) -> torch.Ten
     return value.contiguous()
 
 
-def _infer_compute_dtype(tensors: dict[str, torch.Tensor]) -> torch.dtype:
-    for key in ("wscales", "svd_down", "svd_up", "smooth", "bias_packed"):
-        value = tensors.get(key)
-        if value is not None and value.dtype in (torch.float16, torch.bfloat16):
-            return value.dtype
-    return torch.bfloat16
-
-
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
     model_path: Path | None = None
     packed_layer_names: frozenset[str] = frozenset()
@@ -151,7 +134,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.weight = None
         self.bias = None
         self.is_svdint4 = False
-        self.compute_dtype = torch.bfloat16
+        self.compute_dtype = COMPUTE_DTYPE
 
     def _load_from_state_dict(
         self,
@@ -203,18 +186,17 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         if self.model_path is None:
             raise RuntimeError("SVDInt4 Linear missing model_path")
         tensors = _load_layer_tensors(self.model_path, name)
-        compute_dtype = _infer_compute_dtype(tensors)
         self.is_svdint4 = True
-        self.compute_dtype = compute_dtype
+        self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = name
-        self.weight = torch.empty((self.out_features, self.in_features), device="meta", dtype=compute_dtype)
-        self.bias = torch.empty((self.out_features,), device="meta", dtype=compute_dtype) if "bias_packed" in tensors else None
+        self.weight = torch.empty((self.out_features, self.in_features), device="meta", dtype=COMPUTE_DTYPE)
+        self.bias = torch.empty((self.out_features,), device="meta", dtype=COMPUTE_DTYPE) if "bias_packed" in tensors else None
         self.register_buffer("qweight", tensors["qweight"].contiguous())
-        self.register_buffer("wscales", tensors["wscales"].to(compute_dtype).contiguous())
-        self.register_buffer("smooth", _optional_float(tensors.get("smooth"), compute_dtype))
-        self.register_buffer("svd_down", tensors["svd_down"].to(compute_dtype).contiguous())
-        self.register_buffer("svd_up", tensors["svd_up"].to(compute_dtype).contiguous())
-        self.register_buffer("bias_packed", _optional_float(tensors.get("bias_packed"), compute_dtype))
+        self.register_buffer("wscales", tensors["wscales"].to(COMPUTE_DTYPE).contiguous())
+        self.register_buffer("smooth", _optional_float(tensors.get("smooth"), COMPUTE_DTYPE))
+        self.register_buffer("svd_down", tensors["svd_down"].to(COMPUTE_DTYPE).contiguous())
+        self.register_buffer("svd_up", tensors["svd_up"].to(COMPUTE_DTYPE).contiguous())
+        self.register_buffer("bias_packed", _optional_float(tensors.get("bias_packed"), COMPUTE_DTYPE))
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         if not self.is_svdint4:
@@ -238,7 +220,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         if input.device.type != "cuda":
             raise RuntimeError("SVDInt4 Linear requires CUDA input tensors")
 
-        _validate_cuda_kernel_runtime(input, self.compute_dtype)
+        _validate_cuda_kernel_runtime(input)
         svd_int4_linear = _load_svdint4_linear()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
@@ -253,7 +235,6 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             bias_packed=self.bias_packed,
             out_features=self.out_features,
         )
-        _sync_if_requested(x)
         return out if out.dtype == original_dtype else out.to(original_dtype)
 
 

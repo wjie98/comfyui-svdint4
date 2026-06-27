@@ -161,8 +161,9 @@ bernini-low.safetensors
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`.
 
-The loader infers the kernel compute dtype from the packed tensors. There is no
-separate model dtype setting.
+The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
+compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
+not support it.
 
 The node category is:
 
@@ -195,21 +196,10 @@ python -m pip install -v --no-build-isolation \
 Make sure the CUDA toolkit used by `nvcc` matches your PyTorch CUDA version.
 For source builds, also make sure `--no-build-isolation` is present.
 
-Windows runtime debugging
+Windows runtime
 
-SVDInt4 supports Turing/sm75 or newer GPUs. BF16 SVDInt4 tensors require
-Ampere/sm80 or newer; Turing must use FP16 tensors. The loader checks these
-conditions before launching the custom CUDA kernel.
-
-If Windows still reports a driver reset or crash, enable synchronous CUDA error
-reporting before starting ComfyUI:
-
-```powershell
-$env:SVDINT4_CUDA_SYNC = "1"
-```
-
-This makes each SVDInt4 op synchronize after launch so the Python traceback is
-closer to the failing operation. It is slower and intended for debugging only.
+The loader uses FP16 by default on every supported GPU, including Ampere and
+newer cards. SVDInt4 requires Turing/sm75 or newer.
 
 `fatal error C1083: ... cusparse.h: No such file or directory`
 

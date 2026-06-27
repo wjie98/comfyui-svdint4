@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 
 import torch
@@ -8,8 +7,6 @@ from torch import nn
 
 from . import _C
 from .packing import PackedInt4Weight, pack_bias, pack_linear_weight, pack_smooth
-
-CUDA_SYNC_ENV = "SVDINT4_CUDA_SYNC"
 
 
 def _validate_cuda_kernel_runtime(x: torch.Tensor, dtype: torch.dtype) -> None:
@@ -21,11 +18,6 @@ def _validate_cuda_kernel_runtime(x: torch.Tensor, dtype: torch.dtype) -> None:
         raise RuntimeError(f"SVDInt4 requires NVIDIA Turing/sm75 or newer, got sm{sm}")
     if dtype == torch.bfloat16 and sm < 80:
         raise RuntimeError("SVDInt4 bfloat16 kernels require Ampere/sm80 or newer")
-
-
-def _sync_if_requested(x: torch.Tensor) -> None:
-    if os.environ.get(CUDA_SYNC_ENV) == "1":
-        torch.cuda.synchronize(x.device)
 
 
 def quantize_act_lora(
@@ -41,9 +33,7 @@ def quantize_act_lora(
     if smooth_packed is None:
         smooth = torch.ones(svd_down_packed.shape[0], dtype=x.dtype, device=x.device)
         smooth_packed = pack_smooth(smooth, k_pad=svd_down_packed.shape[0])
-    result = _C.quantize_act_lora(x.contiguous(), svd_down_packed.contiguous(), smooth_packed.contiguous(), pad_size)
-    _sync_if_requested(x)
-    return result
+    return _C.quantize_act_lora(x.contiguous(), svd_down_packed.contiguous(), smooth_packed.contiguous(), pad_size)
 
 
 def gemm_svd(
@@ -61,7 +51,7 @@ def gemm_svd(
     lora_scales: list[float] | None = None,
 ) -> torch.Tensor:
     _validate_cuda_kernel_runtime(qact, wscales.dtype)
-    result = _C.gemm_svd(
+    return _C.gemm_svd(
         qact.contiguous(),
         qweight.contiguous(),
         ascales.contiguous(),
@@ -74,8 +64,6 @@ def gemm_svd(
         act_unsigned,
         [] if lora_scales is None else lora_scales,
     )
-    _sync_if_requested(qact)
-    return result
 
 
 def linear_svd(
@@ -96,7 +84,7 @@ def linear_svd(
     if smooth_packed is None:
         smooth = torch.ones(svd_down_packed.shape[0], dtype=x.dtype, device=x.device)
         smooth_packed = pack_smooth(smooth, k_pad=svd_down_packed.shape[0])
-    result = _C.linear_svd(
+    return _C.linear_svd(
         x.contiguous(),
         qweight.contiguous(),
         wscales.contiguous(),
@@ -109,8 +97,6 @@ def linear_svd(
         [] if lora_scales is None else lora_scales,
         pad_size,
     )
-    _sync_if_requested(x)
-    return result
 
 
 def _extra_lora_delta(
