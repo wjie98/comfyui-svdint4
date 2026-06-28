@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import uuid
 from pathlib import Path
 
@@ -40,6 +41,11 @@ SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 COMPUTE_DTYPE = torch.float16
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
+SVDINT4_PROFILE = os.environ.get("SVDINT4_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+SVDINT4_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_PROFILE_INTERVAL", "200")))
+_SVDINT4_PROFILE_STATS: dict[str, dict[str, object]] = {}
+_SVDINT4_PROFILE_CALLS = 0
+_SVDINT4_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
 
 
 def _kernel_install_hint() -> str:
@@ -163,6 +169,43 @@ def _adapter_weights_nbytes(value) -> int:
 
 def _adapter_to_device(adapter: comfy.weight_adapter.WeightAdapterBase, device: torch.device, dtype: torch.dtype):
     return type(adapter)(adapter.loaded_keys, _adapter_weights_to(adapter.weights, device, dtype))
+
+
+def _record_svdint4_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
+    global _SVDINT4_PROFILE_CALLS
+    _SVDINT4_PROFILE_CALLS += 1
+    _SVDINT4_PROFILE_PENDING.append((name, start, end, input_shape))
+    if _SVDINT4_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
+        return
+
+    _flush_svdint4_profile()
+
+
+def _flush_svdint4_profile() -> None:
+    if not _SVDINT4_PROFILE_PENDING:
+        return
+
+    _SVDINT4_PROFILE_PENDING[-1][2].synchronize()
+    for name, start, end, input_shape in _SVDINT4_PROFILE_PENDING:
+        elapsed_ms = start.elapsed_time(end)
+        stats = _SVDINT4_PROFILE_STATS.setdefault(name, {"calls": 0, "ms": 0.0, "shape": input_shape})
+        stats["calls"] = int(stats["calls"]) + 1
+        stats["ms"] = float(stats["ms"]) + elapsed_ms
+        stats["shape"] = input_shape
+    _SVDINT4_PROFILE_PENDING.clear()
+
+    total_ms = sum(float(item["ms"]) for item in _SVDINT4_PROFILE_STATS.values())
+    top = sorted(_SVDINT4_PROFILE_STATS.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
+    summary = "; ".join(
+        f"{layer}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
+        for layer, item in top
+    )
+    LOG.info(
+        "SVDInt4 profile after %d Linear calls: total %.2fs; %s",
+        _SVDINT4_PROFILE_CALLS,
+        total_ms / 1000.0,
+        summary,
+    )
 
 
 @dataclasses.dataclass
@@ -568,6 +611,10 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             raise RuntimeError("SVDInt4 Linear requires CUDA input tensors")
 
         _validate_cuda_kernel_runtime(input)
+        if SVDINT4_PROFILE:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
         if len(self.weight_function) == 0 and self.weight is not None and self.weight.device == x.device:
@@ -590,7 +637,12 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 if weight is not None:
                     comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
         out = self._apply_lora_adapters(x, out)
-        return out if out.dtype == original_dtype else out.to(original_dtype)
+        if out.dtype != original_dtype:
+            out = out.to(original_dtype)
+        if SVDINT4_PROFILE:
+            end.record()
+            _record_svdint4_profile(getattr(self, "packed_name", "<unknown>"), start, end, tuple(input.shape))
+        return out
 
 
 class SVDInt4Ops(comfy.ops.manual_cast):
@@ -864,6 +916,8 @@ def load_svdint4_model(
     )
     if disable_dynamic:
         LOG.info("SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; DynamicVRAM staging is disabled for this model.")
+    if SVDINT4_PROFILE:
+        LOG.warning("SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls.", SVDINT4_PROFILE_INTERVAL)
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
     model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters))
     return model
