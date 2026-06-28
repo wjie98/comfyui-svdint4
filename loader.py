@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
-import importlib
 import logging
-import os
 import uuid
 from pathlib import Path
 
@@ -43,29 +40,6 @@ SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 COMPUTE_DTYPE = torch.float16
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
-SVDINT4_PROFILE = os.environ.get("SVDINT4_PROFILE", "").lower() in {"1", "true", "yes", "on"}
-SVDINT4_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_PROFILE_INTERVAL", "200")))
-SVDINT4_ATTENTION_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_ATTENTION_PROFILE_INTERVAL", "40")))
-SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER = "_svdint4_direct_attention_profile"
-SVDINT4_DIRECT_ATTENTION_MODULES = (
-    "comfy.ldm.wan.model",
-    "comfy.ldm.wan.ar_model",
-    "comfy.ldm.wan.model_multitalk",
-    "comfy.ldm.wan.model_animate",
-    "comfy.ldm.wan.model_wandancer",
-)
-_SVDINT4_PROFILE_STATS: dict[str, dict[str, object]] = {}
-_SVDINT4_PROFILE_CALLS = 0
-_SVDINT4_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
-_SVDINT4_BASE_PROFILE_STATS: dict[str, dict[str, object]] = {}
-_SVDINT4_BASE_PROFILE_CALLS = 0
-_SVDINT4_BASE_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
-_SVDINT4_ADAPTER_PROFILE_STATS: dict[str, dict[str, object]] = {}
-_SVDINT4_ADAPTER_PROFILE_CALLS = 0
-_SVDINT4_ADAPTER_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
-_SVDINT4_ATTENTION_PROFILE_STATS: dict[str, dict[str, object]] = {}
-_SVDINT4_ATTENTION_PROFILE_CALLS = 0
-_SVDINT4_ATTENTION_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
 
 
 def _kernel_install_hint() -> str:
@@ -88,6 +62,8 @@ def _load_svdint4_linear():
 
 
 def _validate_cuda_kernel_runtime(x: torch.Tensor) -> None:
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 kernel inputs must be CUDA tensors")
     major, minor = torch.cuda.get_device_capability(x.device)
     sm = major * 10 + minor
     if sm < 75:
@@ -143,6 +119,101 @@ def _collect_packed_layers_from_handle(handle) -> dict[str, dict[str, tuple[str,
     return valid
 
 
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _validate_rank(name: str, field: str, shape: tuple[int, ...], rank: int) -> None:
+    if len(shape) != rank:
+        raise ValueError(f"SVDInt4 layer {name}.{field} must be {rank}D, got shape {shape}")
+    if any(int(dim) <= 0 for dim in shape):
+        raise ValueError(f"SVDInt4 layer {name}.{field} has an invalid empty dimension: {shape}")
+
+
+def _validate_packed_layer_shapes(name: str, fields: dict[str, tuple[str, tuple[int, ...]]]) -> tuple[int, int]:
+    qshape = fields["qweight"][1]
+    _validate_rank(name, "qweight", qshape, 2)
+    out_features = int(qshape[0])
+    in_features = int(qshape[1]) * 2
+    if out_features % 128 != 0:
+        raise ValueError(
+            f"SVDInt4 layer {name}.qweight out_features must be padded to a multiple of 128, got {out_features}"
+        )
+    if in_features % 64 != 0:
+        raise ValueError(
+            f"SVDInt4 layer {name}.qweight in_features must be padded to a multiple of 64, got {in_features}"
+        )
+
+    wshape = fields["wscales"][1]
+    _validate_rank(name, "wscales", wshape, 2)
+    expected_wscale_numel = (in_features // 64) * out_features
+    if _shape_numel(wshape) != expected_wscale_numel:
+        raise ValueError(
+            f"SVDInt4 layer {name}.wscales has {wshape} ({_shape_numel(wshape)} values), "
+            f"expected {(in_features // 64, out_features)} or any 2D shape with {expected_wscale_numel} values"
+        )
+
+    down_shape = fields["svd_down"][1]
+    up_shape = fields["svd_up"][1]
+    _validate_rank(name, "svd_down", down_shape, 2)
+    _validate_rank(name, "svd_up", up_shape, 2)
+    if int(down_shape[0]) != in_features:
+        raise ValueError(f"SVDInt4 layer {name}.svd_down K must match qweight K {in_features}, got {down_shape}")
+    if int(up_shape[0]) != out_features:
+        raise ValueError(f"SVDInt4 layer {name}.svd_up N must match qweight N {out_features}, got {up_shape}")
+    if int(down_shape[1]) != int(up_shape[1]):
+        raise ValueError(f"SVDInt4 layer {name} SVD rank mismatch: svd_down={down_shape}, svd_up={up_shape}")
+    if int(down_shape[1]) % 16 != 0:
+        raise ValueError(f"SVDInt4 layer {name} SVD rank must be padded to a multiple of 16, got {down_shape[1]}")
+
+    if "smooth" in fields:
+        smooth_shape = fields["smooth"][1]
+        _validate_rank(name, "smooth", smooth_shape, 1)
+        if _shape_numel(smooth_shape) != in_features:
+            raise ValueError(f"SVDInt4 layer {name}.smooth must contain {in_features} values, got shape {smooth_shape}")
+    if "bias_packed" in fields:
+        bias_shape = fields["bias_packed"][1]
+        _validate_rank(name, "bias_packed", bias_shape, 1)
+        if _shape_numel(bias_shape) != out_features:
+            raise ValueError(
+                f"SVDInt4 layer {name}.bias_packed must contain {out_features} values, got shape {bias_shape}"
+            )
+
+    return in_features, out_features
+
+
+def _validate_packed_layer_tensors(
+    name: str,
+    tensors: dict[str, torch.Tensor],
+    expected_in: int,
+    expected_out: int,
+) -> None:
+    for field in REQUIRED_FIELDS:
+        if field not in tensors:
+            raise ValueError(f"SVDInt4 layer {name} is missing required tensor {field}")
+
+    qweight = tensors["qweight"]
+    if qweight.dtype not in (torch.int8, torch.uint8):
+        raise TypeError(f"SVDInt4 layer {name}.qweight must be packed int8/uint8, got {qweight.dtype}")
+    q_in = int(qweight.shape[1]) * 2 if qweight.ndim == 2 else -1
+    q_out = int(qweight.shape[0]) if qweight.ndim == 2 else -1
+    if q_in != int(expected_in) or q_out != int(expected_out):
+        raise ValueError(
+            f"SVDInt4 layer {name}.qweight shape changed while loading: got {tuple(qweight.shape)}, "
+            f"expected packed shape ({expected_out}, {expected_in // 2})"
+        )
+
+    for field in ("wscales", "svd_down", "svd_up", "smooth", "bias_packed"):
+        value = tensors.get(field)
+        if value is None:
+            continue
+        if value.dtype != COMPUTE_DTYPE:
+            raise TypeError(f"SVDInt4 layer {name}.{field} must be {COMPUTE_DTYPE}, got {value.dtype}")
+
+
 def _owned_cpu_tensor(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
     if dtype is not None and value.dtype != dtype:
         return value.to(dtype).contiguous()
@@ -189,213 +260,6 @@ def _adapter_weights_nbytes(value) -> int:
 
 def _adapter_to_device(adapter: comfy.weight_adapter.WeightAdapterBase, device: torch.device, dtype: torch.dtype):
     return type(adapter)(adapter.loaded_keys, _adapter_weights_to(adapter.weights, device, dtype))
-
-
-def _flush_cuda_event_profile(
-    pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]],
-    stats_by_name: dict[str, dict[str, object]],
-    call_count: int,
-    label: str,
-    call_unit: str,
-) -> None:
-    if not pending:
-        return
-
-    pending[-1][2].synchronize()
-    for name, start, end, shape in pending:
-        elapsed_ms = start.elapsed_time(end)
-        stats = stats_by_name.setdefault(name, {"calls": 0, "ms": 0.0, "shape": shape})
-        stats["calls"] = int(stats["calls"]) + 1
-        stats["ms"] = float(stats["ms"]) + elapsed_ms
-        stats["shape"] = shape
-    pending.clear()
-
-    total_ms = sum(float(item["ms"]) for item in stats_by_name.values())
-    top = sorted(stats_by_name.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
-    summary = "; ".join(
-        f"{name}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
-        for name, item in top
-    )
-    LOG.info(
-        "%s after %d %s: total %.2fs; %s",
-        label,
-        call_count,
-        call_unit,
-        total_ms / 1000.0,
-        summary,
-    )
-
-
-def _record_svdint4_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
-    global _SVDINT4_PROFILE_CALLS
-    _SVDINT4_PROFILE_CALLS += 1
-    _SVDINT4_PROFILE_PENDING.append((name, start, end, input_shape))
-    if _SVDINT4_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
-        return
-
-    _flush_svdint4_profile()
-
-
-def _flush_svdint4_profile() -> None:
-    _flush_cuda_event_profile(
-        _SVDINT4_PROFILE_PENDING,
-        _SVDINT4_PROFILE_STATS,
-        _SVDINT4_PROFILE_CALLS,
-        "SVDInt4 profile",
-        "Linear calls",
-    )
-
-
-def _record_svdint4_base_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
-    global _SVDINT4_BASE_PROFILE_CALLS
-    _SVDINT4_BASE_PROFILE_CALLS += 1
-    _SVDINT4_BASE_PROFILE_PENDING.append((name, start, end, input_shape))
-    if _SVDINT4_BASE_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
-        return
-
-    _flush_svdint4_base_profile()
-
-
-def _flush_svdint4_base_profile() -> None:
-    _flush_cuda_event_profile(
-        _SVDINT4_BASE_PROFILE_PENDING,
-        _SVDINT4_BASE_PROFILE_STATS,
-        _SVDINT4_BASE_PROFILE_CALLS,
-        "SVDInt4 base Linear profile",
-        "base Linear calls",
-    )
-
-
-def _record_svdint4_adapter_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
-    global _SVDINT4_ADAPTER_PROFILE_CALLS
-    _SVDINT4_ADAPTER_PROFILE_CALLS += 1
-    _SVDINT4_ADAPTER_PROFILE_PENDING.append((name, start, end, input_shape))
-    if _SVDINT4_ADAPTER_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
-        return
-
-    _flush_svdint4_adapter_profile()
-
-
-def _flush_svdint4_adapter_profile() -> None:
-    _flush_cuda_event_profile(
-        _SVDINT4_ADAPTER_PROFILE_PENDING,
-        _SVDINT4_ADAPTER_PROFILE_STATS,
-        _SVDINT4_ADAPTER_PROFILE_CALLS,
-        "SVDInt4 adapter LoRA profile",
-        "adapter LoRA overlay calls",
-    )
-
-
-def _attention_profile_key(func, args, kwargs) -> tuple[str, tuple[int, ...]]:
-    q = args[0]
-    k = args[1]
-    heads = kwargs.get("heads", args[3] if len(args) > 3 else None)
-    skip_reshape = kwargs.get("skip_reshape", False)
-    if skip_reshape:
-        q_tokens = int(q.shape[-2])
-        k_tokens = int(k.shape[-2])
-        dim_head = int(q.shape[-1])
-    else:
-        q_tokens = int(q.shape[1])
-        k_tokens = int(k.shape[1])
-        dim_head = int(q.shape[-1] // heads) if heads else int(q.shape[-1])
-    shape = (q_tokens, k_tokens, int(heads) if heads else -1, dim_head)
-    func_name = getattr(func, "__name__", "attention")
-    if q_tokens == k_tokens:
-        attn_kind = "self"
-    elif k_tokens <= 512:
-        attn_kind = "cross_text_or_img"
-    else:
-        attn_kind = "cross"
-    return f"{func_name}:{attn_kind}:q{q_tokens}:k{k_tokens}:h{heads}:d{dim_head}", shape
-
-
-def _record_svdint4_attention_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, shape: tuple[int, ...]) -> None:
-    global _SVDINT4_ATTENTION_PROFILE_CALLS
-    _SVDINT4_ATTENTION_PROFILE_CALLS += 1
-    _SVDINT4_ATTENTION_PROFILE_PENDING.append((name, start, end, shape))
-    if _SVDINT4_ATTENTION_PROFILE_CALLS % SVDINT4_ATTENTION_PROFILE_INTERVAL != 0:
-        return
-
-    _flush_svdint4_attention_profile()
-
-
-def _flush_svdint4_attention_profile() -> None:
-    _flush_cuda_event_profile(
-        _SVDINT4_ATTENTION_PROFILE_PENDING,
-        _SVDINT4_ATTENTION_PROFILE_STATS,
-        _SVDINT4_ATTENTION_PROFILE_CALLS,
-        "SVDInt4 attention profile",
-        "attention calls",
-    )
-
-
-def _profile_attention_call(func, *args, **kwargs):
-    name, shape = _attention_profile_key(func, args, kwargs)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    out = func(*args, **kwargs)
-    end.record()
-    _record_svdint4_attention_profile(name, start, end, shape)
-    return out
-
-
-def _profile_direct_attention_call(func, *args, **kwargs):
-    name, shape = _attention_profile_key(func, args, kwargs)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    profiled_kwargs = dict(kwargs)
-    profiled_kwargs[SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER] = True
-    start.record()
-    out = func(*args, **profiled_kwargs)
-    end.record()
-    _record_svdint4_attention_profile(name, start, end, shape)
-    return out
-
-
-def _install_direct_attention_profiler() -> None:
-    installed = []
-    for module_name in SVDINT4_DIRECT_ATTENTION_MODULES:
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
-        current = getattr(module, "optimized_attention", None)
-        if current is None or getattr(current, "_svdint4_direct_attention_profile_installed", False):
-            continue
-
-        @functools.wraps(current)
-        def profiled_attention(*args, _svdint4_attention_func=current, **kwargs):
-            return _profile_direct_attention_call(_svdint4_attention_func, *args, **kwargs)
-
-        profiled_attention._svdint4_direct_attention_profile_installed = True
-        module.optimized_attention = profiled_attention
-        installed.append(module_name)
-
-    if installed:
-        LOG.info("SVDInt4 direct Wan attention profiler installed for: %s", ", ".join(installed))
-
-
-def _install_attention_profiler(model_patcher) -> None:
-    transformer_options = model_patcher.model_options.setdefault("transformer_options", {})
-    existing_override = transformer_options.get("optimized_attention_override")
-    if getattr(existing_override, "_svdint4_attention_profile_installed", False):
-        return
-
-    if existing_override is None:
-        def profile_override(func, *args, **kwargs):
-            if kwargs.get(SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER, False):
-                return func(*args, **kwargs)
-            return _profile_attention_call(func, *args, **kwargs)
-    else:
-        def profile_override(func, *args, **kwargs):
-            if kwargs.get(SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER, False):
-                return existing_override(func, *args, **kwargs)
-            return _profile_attention_call(lambda *a, **kw: existing_override(func, *a, **kw), *args, **kwargs)
-
-    profile_override._svdint4_attention_profile_installed = True
-    transformer_options["optimized_attention_override"] = profile_override
 
 
 @dataclasses.dataclass
@@ -570,6 +434,14 @@ class SVDInt4PackedTensor:
         self.shape = torch.Size((self.out_features, self.in_features))
         self.dtype = compute_dtype
         self.requires_grad = False
+        shape_fields = {field: (f"{name}.{field}", tuple(value.shape)) for field, value in tensors.items()}
+        actual_in, actual_out = _validate_packed_layer_shapes(name, shape_fields)
+        _validate_packed_layer_tensors(name, tensors, actual_in, actual_out)
+        if actual_in != self.in_features or actual_out != self.out_features:
+            raise ValueError(
+                f"SVDInt4 layer {name} shape mismatch with ComfyUI model config: "
+                f"packed=({actual_out}, {actual_in}), module=({self.out_features}, {self.in_features})"
+            )
         self.has_bias_packed = "bias_packed" in tensors
         qweight = tensors["qweight"].contiguous()
         wscales = tensors["wscales"].contiguous()
@@ -600,7 +472,14 @@ class SVDInt4PackedTensor:
             self.tensor = None
         self.packed_nbytes = sum(
             _tensor_nbytes(value)
-            for value in (qweight, wscales, smooth if has_smooth else None, svd_down, svd_up, bias_packed if self.has_bias_packed else None)
+            for value in (
+                qweight,
+                wscales,
+                smooth if has_smooth else None,
+                svd_down,
+                svd_up,
+                bias_packed if self.has_bias_packed else None,
+            )
         )
 
     @property
@@ -801,18 +680,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             raise RuntimeError("SVDInt4 Linear requires CUDA input tensors")
 
         _validate_cuda_kernel_runtime(input)
-        if SVDINT4_PROFILE:
-            profile_name = getattr(self, "packed_name", "<unknown>")
-            profile_shape = tuple(input.shape)
-            total_start = torch.cuda.Event(enable_timing=True)
-            total_end = torch.cuda.Event(enable_timing=True)
-            base_start = torch.cuda.Event(enable_timing=True)
-            base_end = torch.cuda.Event(enable_timing=True)
-            total_start.record()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
-        if SVDINT4_PROFILE:
-            base_start.record()
         if len(self.weight_function) == 0 and self.weight is not None and self.weight.device == x.device:
             out = torch.nn.functional.linear(x, self.weight, None)
         else:
@@ -832,27 +701,9 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 self.weight_function = saved_weight_function
                 if weight is not None:
                     comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
-        if SVDINT4_PROFILE:
-            base_end.record()
-
-        adapter_start = None
-        adapter_end = None
-        adapter_count = len(self._svdint4_adapter_lora_overlays)
-        if SVDINT4_PROFILE and adapter_count:
-            adapter_start = torch.cuda.Event(enable_timing=True)
-            adapter_end = torch.cuda.Event(enable_timing=True)
-            adapter_start.record()
         out = self._apply_lora_adapters(x, out)
-        if SVDINT4_PROFILE and adapter_count:
-            adapter_end.record()
         if out.dtype != original_dtype:
             out = out.to(original_dtype)
-        if SVDINT4_PROFILE:
-            total_end.record()
-            _record_svdint4_base_profile(profile_name, base_start, base_end, profile_shape)
-            if adapter_start is not None and adapter_end is not None:
-                _record_svdint4_adapter_profile(profile_name, adapter_start, adapter_end, profile_shape)
-            _record_svdint4_profile(profile_name, total_start, total_end, profile_shape)
         return out
 
 
@@ -872,6 +723,8 @@ def build_loader_state_dict(
     model_path: str | Path,
 ) -> tuple[dict[str, torch.Tensor], dict[str, str], dict[str, dict[str, torch.Tensor]]]:
     model_path = Path(model_path)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"SVDInt4 model file does not exist: {model_path}")
     state_dict: dict[str, torch.Tensor] = {}
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -881,6 +734,10 @@ def build_loader_state_dict(
         packed_layers = _collect_packed_layers_from_handle(handle)
         if not packed_layers:
             raise ValueError(f"{model_path} does not contain any complete SVDInt4 Linear layers")
+        packed_layer_shapes = {
+            name: _validate_packed_layer_shapes(name, fields)
+            for name, fields in packed_layers.items()
+        }
 
         for key in handle.keys():
             split = _split_packed_key(key)
@@ -892,11 +749,10 @@ def build_loader_state_dict(
             tensors: dict[str, torch.Tensor] = {}
             for field, (key, _) in fields.items():
                 tensors[field] = _owned_cpu_tensor(handle.get_tensor(key), _packed_tensor_dtype(field))
+            in_features, out_features = packed_layer_shapes[name]
+            _validate_packed_layer_tensors(name, tensors, in_features, out_features)
             packed_layer_tensors[name] = tensors
 
-            qshape = fields["qweight"][1]
-            out_features = int(qshape[0])
-            in_features = int(qshape[1] * 2)
             state_dict[f"{name}.weight"] = torch.empty((out_features, in_features), device="meta", dtype=torch.float16)
             if "bias_packed" in fields:
                 state_dict[f"{name}.bias"] = torch.empty((out_features,), device="meta", dtype=torch.float16)
@@ -909,14 +765,18 @@ def build_loader_state_dict(
     return state_dict, metadata, packed_layer_tensors
 
 
-def _patch_key_name(key) -> str:
+def _patch_key_name(key) -> str | None:
     if isinstance(key, str):
         return key
+    if not isinstance(key, (tuple, list)) or len(key) == 0 or not isinstance(key[0], str):
+        return None
     return key[0]
 
 
 def _patch_key_offset_function(key):
     if isinstance(key, str):
+        return None, None
+    if not isinstance(key, (tuple, list)) or len(key) < 2:
         return None, None
     offset = key[1]
     function = key[2] if len(key) > 2 else None
@@ -947,14 +807,16 @@ def _install_svdint4_patch_filter() -> None:
 
         for key, patch_data in patches.items():
             weight_key = _patch_key_name(key)
-            if weight_key not in packed_weight_keys:
+            if weight_key is None or weight_key not in packed_weight_keys:
                 passthrough[key] = patch_data
                 continue
 
             handled.add(key)
             offset, function = _patch_key_offset_function(key)
             if enable_lora_adapters and isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
-                pending.setdefault(weight_key, []).append((strength_patch, patch_data, strength_model, offset, function))
+                pending.setdefault(weight_key, []).append(
+                    (strength_patch, patch_data, strength_model, offset, function)
+                )
                 overlaid += 1
             else:
                 if enable_lora_adapters:
@@ -980,7 +842,9 @@ def _install_svdint4_lora_key_map() -> None:
     if getattr(model_lora_keys_unet, "_svdint4_key_map_installed", False):
         return
 
-    def svdint4_model_lora_keys_unet(model, key_map={}):
+    def svdint4_model_lora_keys_unet(model, key_map=None):
+        if key_map is None:
+            key_map = {}
         key_map = model_lora_keys_unet(model, key_map)
         packed_weight_keys = getattr(model, "_svdint4_weight_keys", None)
         if not packed_weight_keys:
@@ -1027,7 +891,8 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
         ignored_count = int(getattr(model_patcher.model, "_svdint4_ignored_adapter_lora_patch_count", 0))
         if ignored_count:
             LOG.info(
-                "SVDInt4 ignored %d adapter LoRA patch(es) targeting packed Linear weights; enable_lora_adapters to run them as fp16 adapter LoRA overlays",
+                "SVDInt4 ignored %d adapter LoRA patch(es) targeting packed Linear weights; "
+                "enable_lora_adapters to run them as fp16 adapter LoRA overlays",
                 ignored_count,
             )
         return
@@ -1043,15 +908,13 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
     skipped_count = int(getattr(model_patcher.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
     if skipped_count:
         LOG.warning(
-            "SVDInt4 ignored %d non-adapter patch(es) targeting packed Linear weights; dense diff/set patches are unsupported for packed weights",
+            "SVDInt4 ignored %d non-adapter patch(es) targeting packed Linear weights; "
+            "dense diff/set patches are unsupported for packed weights",
             skipped_count,
         )
 
 
 def _after_model_load(model_patcher, *_) -> None:
-    if SVDINT4_PROFILE:
-        _install_direct_attention_profiler()
-        _install_attention_profiler(model_patcher)
     _attach_lora_adapter_overlays(model_patcher)
     root = model_patcher.model
     LOG.info(
@@ -1080,12 +943,18 @@ def load_svdint4_model(
     disable_dynamic: bool = True,
     enable_lora_adapters: bool = False,
 ):
+    if not _HAS_COMFY_QUANTIZED_TENSOR:
+        raise RuntimeError(
+            "SVDInt4 requires a ComfyUI build with comfy.quant_ops.QuantizedTensor support. "
+            "Update ComfyUI before loading SVDInt4 packed models."
+        )
     _install_svdint4_patch_filter()
     _install_svdint4_lora_key_map()
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
     packed_state_bytes = packed_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
+    unused_packed_layers: tuple[str, ...] = ()
     try:
         model = comfy.sd.load_diffusion_model_state_dict(
             state_dict,
@@ -1095,11 +964,15 @@ def load_svdint4_model(
         )
     finally:
         if packed_layer_tensors:
-            LOG.warning(
-                "SVDInt4 model load left %d packed Linear layers unused; clearing them to release CPU memory",
-                len(packed_layer_tensors),
-            )
+            unused_packed_layers = tuple(sorted(packed_layer_tensors))
             packed_layer_tensors.clear()
+    if unused_packed_layers:
+        sample = ", ".join(unused_packed_layers[:8])
+        suffix = "" if len(unused_packed_layers) <= 8 else ", ..."
+        raise RuntimeError(
+            f"SVDInt4 model load left {len(unused_packed_layers)} packed Linear layer(s) unused "
+            f"({sample}{suffix}). The file layout does not match the model architecture ComfyUI selected."
+        )
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.model._svdint4_packed_bytes = packed_bytes
@@ -1115,6 +988,8 @@ def load_svdint4_model(
         if getattr(module, "is_svdint4", False):
             module.weight_function = []
             packed_weight_keys.add(f"{name}.weight")
+    if not packed_weight_keys:
+        raise RuntimeError(f"SVDInt4 model load did not install any packed Linear weights from {model_path}")
     model.model._svdint4_weight_keys = frozenset(packed_weight_keys)
     base_size = model.model_size()
     model.size = base_size
@@ -1129,16 +1004,10 @@ def load_svdint4_model(
         "enabled" if model.model._svdint4_enable_lora_adapters else "disabled",
     )
     if disable_dynamic:
-        LOG.info("SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; DynamicVRAM staging is disabled for this model.")
-    if SVDINT4_PROFILE:
-        _install_direct_attention_profiler()
-        _install_attention_profiler(model)
-        LOG.warning(
-            "SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls "
-            "(base/adapter/total) and every %d attention calls.",
-            SVDINT4_PROFILE_INTERVAL,
-            SVDINT4_ATTENTION_PROFILE_INTERVAL,
+        LOG.info(
+            "SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; "
+            "DynamicVRAM staging is disabled for this model."
         )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
-    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters))
+    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters, disable_dynamic))
     return model

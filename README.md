@@ -208,24 +208,6 @@ LoRAs to run as fp16 overlays on top of the packed model. Dense `diff`/`set`
 weight patches are intentionally not supported for packed SVDInt4 weights.
 Repack the model when a LoRA is meant to become part of the quantized base.
 
-## Profiling
-
-Set `SVDINT4_PROFILE=1` before starting ComfyUI to enable lightweight CUDA
-event profiling. Optional intervals:
-
-```bash
-SVDINT4_PROFILE_INTERVAL=400
-SVDINT4_ATTENTION_PROFILE_INTERVAL=40
-```
-
-The log prints separate totals for:
-
-- `SVDInt4 base Linear profile`: packed SVDInt4 kernel time only.
-- `SVDInt4 adapter LoRA profile`: external adapter overlay time only, emitted
-  only when compatible adapter LoRAs are attached.
-- `SVDInt4 profile`: total SVDInt4 Linear module time.
-- `SVDInt4 attention profile`: attention backend time when profiling is enabled.
-
 ## Smoke Tests
 
 Local load and single-layer CUDA forward:

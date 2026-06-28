@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import folder_paths
 from safetensors import safe_open
 
 
+LOG = logging.getLogger("comfyui-svdint4")
 FOLDER_NAME = "diffusion_models"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 ENV_PATHS = ("SVDINT4_DIT_PATHS",)
@@ -23,8 +25,12 @@ def _register_extra_model_dirs() -> None:
         for item in os.environ.get(env_name, "").split(os.pathsep):
             if not item:
                 continue
+            path = Path(item).expanduser()
+            if not path.is_dir():
+                LOG.warning("Ignoring %s entry because it is not a directory: %s", env_name, item)
+                continue
             before = _model_dirs()
-            folder_paths.add_model_folder_path(FOLDER_NAME, item)
+            folder_paths.add_model_folder_path(FOLDER_NAME, str(path))
             changed = changed or before != _model_dirs()
     if changed:
         folder_paths.filename_list_cache.pop(FOLDER_NAME, None)
@@ -73,7 +79,9 @@ class SVDInt4DiffusionModelLoader:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Run compatible adapter LoRAs as fp16 overlays on top of packed SVDInt4 Linear layers.",
+                        "tooltip": (
+                            "Run compatible adapter LoRAs as fp16 overlays on top of packed SVDInt4 Linear layers."
+                        ),
                     },
                 ),
             }
