@@ -36,9 +36,13 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
+W4_STORAGE_FIELDS = {"w4_qweight", "w4_scales"}
+W4_STORAGE_REQUIRED_FIELDS = {"w4_qweight", "w4_scales"}
+W4_STORAGE_GROUP_SIZE = 64
 SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 COMPUTE_DTYPE = torch.float16
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
+W4_STORAGE_LAYOUT_NAME = "SVDInt4W4StorageLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
 
 
@@ -79,6 +83,15 @@ def _split_packed_key(key: str) -> tuple[str, str] | None:
     return name, field
 
 
+def _split_w4_storage_key(key: str) -> tuple[str, str] | None:
+    if "." not in key:
+        return None
+    name, field = key.rsplit(".", 1)
+    if field not in W4_STORAGE_FIELDS:
+        return None
+    return name, field
+
+
 def _model_metadata(model_path: Path) -> dict[str, str]:
     with safe_open(model_path, framework="pt", device="cpu") as handle:
         return handle.metadata() or {}
@@ -114,6 +127,25 @@ def _collect_packed_layers_from_handle(handle) -> dict[str, dict[str, tuple[str,
         missing = REQUIRED_FIELDS - fields.keys()
         if missing:
             LOG.warning("Skipping incomplete SVDInt4 layer %s: missing %s", name, sorted(missing))
+            continue
+        valid[name] = fields
+    return valid
+
+
+def _collect_w4_storage_layers_from_handle(handle) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
+    layers: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {}
+    for key in handle.keys():
+        split = _split_w4_storage_key(key)
+        if split is None:
+            continue
+        name, field = split
+        layers.setdefault(name, {})[field] = (key, tuple(handle.get_slice(key).get_shape()))
+
+    valid: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {}
+    for name, fields in sorted(layers.items()):
+        missing = W4_STORAGE_REQUIRED_FIELDS - fields.keys()
+        if missing:
+            LOG.warning("Skipping incomplete W4 storage layer %s: missing %s", name, sorted(missing))
             continue
         valid[name] = fields
     return valid
@@ -214,6 +246,41 @@ def _validate_packed_layer_tensors(
             raise TypeError(f"SVDInt4 layer {name}.{field} must be {COMPUTE_DTYPE}, got {value.dtype}")
 
 
+def _validate_w4_storage_layer_tensors(
+    name: str,
+    tensors: dict[str, torch.Tensor],
+    expected_in: int,
+    expected_out: int,
+) -> None:
+    for field in W4_STORAGE_REQUIRED_FIELDS:
+        if field not in tensors:
+            raise ValueError(f"W4 storage layer {name} is missing required tensor {field}")
+
+    qweight = tensors["w4_qweight"]
+    if qweight.dtype not in (torch.uint8, torch.int8):
+        raise TypeError(f"W4 storage layer {name}.w4_qweight must be uint8/int8, got {qweight.dtype}")
+    if qweight.ndim != 2:
+        raise ValueError(f"W4 storage layer {name}.w4_qweight must be 2D, got shape {tuple(qweight.shape)}")
+    expected_packed_in = (int(expected_in) + 1) // 2
+    if int(qweight.shape[0]) != int(expected_out) or int(qweight.shape[1]) != expected_packed_in:
+        raise ValueError(
+            f"W4 storage layer {name}.w4_qweight shape mismatch: got {tuple(qweight.shape)}, "
+            f"expected ({expected_out}, {expected_packed_in}) for dense shape ({expected_out}, {expected_in})"
+        )
+
+    scales = tensors["w4_scales"]
+    if scales.dtype != COMPUTE_DTYPE:
+        raise TypeError(f"W4 storage layer {name}.w4_scales must be {COMPUTE_DTYPE}, got {scales.dtype}")
+    if scales.ndim != 2:
+        raise ValueError(f"W4 storage layer {name}.w4_scales must be 2D, got shape {tuple(scales.shape)}")
+    expected_groups = (int(expected_in) + W4_STORAGE_GROUP_SIZE - 1) // W4_STORAGE_GROUP_SIZE
+    if tuple(scales.shape) != (int(expected_out), expected_groups):
+        raise ValueError(
+            f"W4 storage layer {name}.w4_scales shape mismatch: got {tuple(scales.shape)}, "
+            f"expected ({expected_out}, {expected_groups})"
+        )
+
+
 def _owned_cpu_tensor(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
     if dtype is not None and value.dtype != dtype:
         return value.to(dtype).contiguous()
@@ -224,6 +291,12 @@ def _packed_tensor_dtype(field: str) -> torch.dtype | None:
     if field in {"wscales", "smooth", "svd_down", "svd_up", "bias_packed"}:
         return COMPUTE_DTYPE
     return None
+
+
+def _w4_storage_tensor_dtype(field: str) -> torch.dtype | None:
+    if field == "w4_scales":
+        return COMPUTE_DTYPE
+    return torch.uint8 if field == "w4_qweight" else None
 
 
 def _tensor_nbytes(value: torch.Tensor | None) -> int:
@@ -410,6 +483,88 @@ if _HAS_COMFY_QUANTIZED_TENSOR:
     register_layout_class(SVDINT4_LAYOUT_NAME, SVDInt4PackedLayout)
 
 
+@dataclasses.dataclass(frozen=True)
+class W4StorageParams:
+    scales: torch.Tensor
+    orig_dtype: torch.dtype
+    orig_shape: tuple[int, int]
+    group_size: int = W4_STORAGE_GROUP_SIZE
+    name: str = ""
+
+    def _tensor_fields(self) -> tuple[str, ...]:
+        return ("scales",)
+
+    def to_device(self, device: torch.device) -> "W4StorageParams":
+        return dataclasses.replace(self, scales=self.scales.to(device=device))
+
+    def clone(self) -> "W4StorageParams":
+        return dataclasses.replace(self, scales=self.scales.clone())
+
+    def copy_from(self, src: "W4StorageParams", non_blocking: bool = False) -> None:
+        self.scales.copy_(src.scales, non_blocking=non_blocking)
+        object.__setattr__(self, "orig_dtype", src.orig_dtype)
+        object.__setattr__(self, "orig_shape", src.orig_shape)
+        object.__setattr__(self, "group_size", src.group_size)
+        object.__setattr__(self, "name", src.name)
+
+
+def _dequantize_w4_storage(qdata: torch.Tensor, params: W4StorageParams) -> torch.Tensor:
+    out_features, in_features = params.orig_shape
+    packed = qdata.to(torch.uint8)
+    unpacked = torch.empty(
+        (packed.shape[0], packed.shape[1] * 2),
+        device=packed.device,
+        dtype=torch.int16,
+    )
+    unpacked[:, 0::2] = (packed & 0x0F).to(torch.int16)
+    unpacked[:, 1::2] = (packed >> 4).to(torch.int16)
+    q = unpacked[:, :in_features].to(dtype=params.orig_dtype)
+    q.sub_(8.0)
+    scales = params.scales.to(device=q.device, dtype=params.orig_dtype)
+    expanded_scales = scales.repeat_interleave(params.group_size, dim=1)[:, :in_features]
+    q.mul_(expanded_scales)
+    return q.view(out_features, in_features)
+
+
+class W4StorageLayout(QuantizedLayout):
+    Params = W4StorageParams
+
+    @classmethod
+    def quantize(cls, tensor: torch.Tensor, **kwargs):
+        raise NotImplementedError("W4StorageLayout is loaded from prepacked tensors")
+
+    @classmethod
+    def dequantize(cls, qdata: torch.Tensor, params: W4StorageParams) -> torch.Tensor:
+        return _dequantize_w4_storage(qdata, params)
+
+    @classmethod
+    def get_plain_tensors(cls, qtensor) -> tuple[torch.Tensor, ...]:
+        params = qtensor._params
+        return (qtensor._qdata, params.scales)
+
+    @classmethod
+    def state_dict_tensors(cls, qdata: torch.Tensor, params: W4StorageParams) -> dict[str, torch.Tensor]:
+        return {
+            ".w4_qweight": qdata,
+            ".w4_scales": params.scales,
+        }
+
+
+if _HAS_COMFY_QUANTIZED_TENSOR:
+    register_layout_class(W4_STORAGE_LAYOUT_NAME, W4StorageLayout)
+
+
+@register_layout_op(torch.ops.aten.linear.default, W4StorageLayout)
+def _handle_w4_storage_linear(qt, args, kwargs):
+    input_tensor, weight = args[0], args[1]
+    bias = args[2] if len(args) > 2 else kwargs.get("bias")
+    if not isinstance(weight, QuantizedTensor):
+        return torch.nn.functional.linear(input_tensor, weight, bias)
+    if isinstance(input_tensor, QuantizedTensor):
+        input_tensor = input_tensor.dequantize()
+    return torch.nn.functional.linear(input_tensor, weight.dequantize(), bias)
+
+
 def _svdint4_forward(input_tensor: torch.Tensor, weight_qt, bias: torch.Tensor | None = None) -> torch.Tensor:
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
@@ -560,9 +715,57 @@ class SVDInt4PackedTensor:
         return torch.tensor([], dtype=self.dtype).element_size()
 
 
+class W4StorageTensor:
+    """Weight-only INT4 storage that dequantizes to fp16 only when used."""
+
+    is_svdint4_w4_storage_tensor = True
+
+    def __init__(
+        self,
+        name: str,
+        in_features: int,
+        out_features: int,
+        tensors: dict[str, torch.Tensor],
+        compute_dtype: torch.dtype,
+    ):
+        self.name = name
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.shape = torch.Size((self.out_features, self.in_features))
+        self.dtype = compute_dtype
+        self.requires_grad = False
+        _validate_w4_storage_layer_tensors(name, tensors, self.in_features, self.out_features)
+        qweight = tensors["w4_qweight"].to(torch.uint8).contiguous()
+        scales = tensors["w4_scales"].contiguous()
+        if _HAS_COMFY_QUANTIZED_TENSOR:
+            params = W4StorageParams(
+                scales=scales,
+                orig_dtype=compute_dtype,
+                orig_shape=(self.out_features, self.in_features),
+                group_size=W4_STORAGE_GROUP_SIZE,
+                name=name,
+            )
+            self.tensor = QuantizedTensor(qweight, W4_STORAGE_LAYOUT_NAME, params)
+        else:
+            self.tensor = None
+        self.packed_nbytes = _tensor_nbytes(qweight) + _tensor_nbytes(scales)
+
+    @property
+    def nbytes(self) -> int:
+        return self.packed_nbytes
+
+    def numel(self) -> int:
+        return self.out_features * self.in_features
+
+    def element_size(self) -> int:
+        return torch.tensor([], dtype=self.dtype).element_size()
+
+
 class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
     packed_layer_names: frozenset[str] = frozenset()
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
+    w4_layer_names: frozenset[str] = frozenset()
+    w4_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
         torch.nn.Module.__init__(self)
@@ -576,9 +779,11 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.weight = None
         self.bias = None
         self.is_svdint4 = False
+        self.is_w4_storage = False
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = None
         self.packed_weight: SVDInt4PackedTensor | None = None
+        self.w4_weight: W4StorageTensor | None = None
         self._svdint4_adapter_lora_overlays: list[SVDInt4AdapterOverlay] = []
         self._svdint4_adapter_staging_runtime: SVDInt4AdapterStagingRuntime | None = None
         self._svdint4_adapter_lora_warnings: set[str] = set()
@@ -599,6 +804,13 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 self._load_svdint4(name)
             except Exception as exc:
                 LOG.warning("SVDInt4 layer %s could not be loaded: %s", name, exc)
+                raise
+            return
+        if name in self.w4_layer_names:
+            try:
+                self._load_w4_storage(name, state_dict, prefix, local_metadata, missing_keys)
+            except Exception as exc:
+                LOG.warning("W4 storage layer %s could not be loaded: %s", name, exc)
                 raise
             return
         self._load_dense(state_dict, prefix, local_metadata, missing_keys, unexpected_keys)
@@ -629,6 +841,34 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             self.bias = nn.Parameter(torch.zeros((self.out_features,)), requires_grad=False)
             missing_keys.append(prefix + "bias")
 
+    def _load_w4_storage(self, name: str, state_dict, prefix, local_metadata, missing_keys) -> None:
+        tensors = self.w4_layer_tensors.pop(name, None)
+        if tensors is None:
+            raise RuntimeError(f"W4 storage tensors for {name} were not preloaded")
+        self.is_w4_storage = True
+        self.compute_dtype = COMPUTE_DTYPE
+        self.packed_name = name
+        self.w4_weight = W4StorageTensor(
+            name=name,
+            in_features=self.in_features,
+            out_features=self.out_features,
+            tensors=tensors,
+            compute_dtype=self.compute_dtype,
+        )
+        if self.w4_weight.tensor is None:
+            raise RuntimeError("W4 storage weights require ComfyUI QuantizedTensor support")
+        self.weight = nn.Parameter(self.w4_weight.tensor, requires_grad=False)
+
+        assign_to_params_buffers = local_metadata.get("assign_to_params_buffers", False)
+        bias = state_dict.get(prefix + "bias")
+        if bias is not None:
+            self.bias = nn.Parameter(bias if assign_to_params_buffers else bias.clone(), requires_grad=False)
+        elif self.comfy_need_lazy_init_bias:
+            self.bias = nn.Parameter(torch.zeros((self.out_features,)), requires_grad=False)
+            missing_keys.append(prefix + "bias")
+        else:
+            self.bias = None
+
     def _load_svdint4(self, name: str) -> None:
         tensors = self.packed_layer_tensors.pop(name, None)
         if tensors is None:
@@ -650,6 +890,17 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.weight = nn.Parameter(self.packed_weight.tensor, requires_grad=False)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if self.is_w4_storage:
+            if self.weight is None or self.bias is None and self.comfy_need_lazy_init_bias:
+                return
+            if not isinstance(self.weight, QuantizedTensor) or getattr(self.weight, "_layout_cls", None) != W4_STORAGE_LAYOUT_NAME:
+                raise RuntimeError("W4 storage Linear expected a ComfyUI-managed W4 QuantizedTensor weight")
+            params = self.weight._params
+            destination[prefix + "w4_qweight"] = self.weight._qdata if keep_vars else self.weight._qdata.detach()
+            destination[prefix + "w4_scales"] = params.scales if keep_vars else params.scales.detach()
+            if self.bias is not None:
+                destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
+            return
         if not self.is_svdint4:
             return nn.Module._save_to_state_dict(self, destination, prefix, keep_vars)
         if self.packed_weight is None or self.weight is None:
@@ -780,25 +1031,39 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
 
 
 class SVDInt4Ops(comfy.ops.manual_cast):
-    def __init__(self, packed_layer_tensors: dict[str, dict[str, torch.Tensor]]):
+    def __init__(
+        self,
+        packed_layer_tensors: dict[str, dict[str, torch.Tensor]],
+        w4_layer_tensors: dict[str, dict[str, torch.Tensor]] | None = None,
+    ):
+        if w4_layer_tensors is None:
+            w4_layer_tensors = {}
         self.Linear = type(
             "Linear",
             (SVDInt4LinearOp,),
             {
                 "packed_layer_names": frozenset(packed_layer_tensors),
                 "packed_layer_tensors": packed_layer_tensors,
+                "w4_layer_names": frozenset(w4_layer_tensors),
+                "w4_layer_tensors": w4_layer_tensors,
             },
         )
 
 
 def build_loader_state_dict(
     model_path: str | Path,
-) -> tuple[dict[str, torch.Tensor], dict[str, str], dict[str, dict[str, torch.Tensor]]]:
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, str],
+    dict[str, dict[str, torch.Tensor]],
+    dict[str, dict[str, torch.Tensor]],
+]:
     model_path = Path(model_path)
     if not model_path.is_file():
         raise FileNotFoundError(f"SVDInt4 model file does not exist: {model_path}")
     state_dict: dict[str, torch.Tensor] = {}
     packed_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
+    w4_layer_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
     with safe_open(model_path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
@@ -810,10 +1075,13 @@ def build_loader_state_dict(
             name: _validate_packed_layer_shapes(name, fields)
             for name, fields in packed_layers.items()
         }
+        w4_layers = _collect_w4_storage_layers_from_handle(handle)
 
         for key in handle.keys():
             split = _split_packed_key(key)
             if split is not None:
+                continue
+            if _split_w4_storage_key(key) is not None:
                 continue
             state_dict[key] = _owned_cpu_tensor(handle.get_tensor(key))
 
@@ -829,12 +1097,27 @@ def build_loader_state_dict(
             if "bias_packed" in fields:
                 state_dict[f"{name}.bias"] = torch.empty((out_features,), device="meta", dtype=torch.float16)
 
+        for name, fields in w4_layers.items():
+            tensors = {}
+            for field, (key, _) in fields.items():
+                tensors[field] = _owned_cpu_tensor(handle.get_tensor(key), _w4_storage_tensor_dtype(field))
+            w4_layer_tensors[name] = tensors
+            qshape = fields["w4_qweight"][1]
+            out_features = int(qshape[0])
+            in_features_upper_bound = int(qshape[1]) * 2
+            state_dict[f"{name}.weight"] = torch.empty(
+                (out_features, in_features_upper_bound),
+                device="meta",
+                dtype=torch.float16,
+            )
+
     LOG.info(
-        "SVDInt4 loaded %d packed Linear layers from one safetensors open: %s",
+        "SVDInt4 loaded %d packed Linear layers and %d W4 storage Linear layers from one safetensors open: %s",
         len(packed_layer_tensors),
+        len(w4_layer_tensors),
         model_path,
     )
-    return state_dict, metadata, packed_layer_tensors
+    return state_dict, metadata, packed_layer_tensors, w4_layer_tensors
 
 
 def _patch_key_name(key) -> str | None:
@@ -1049,11 +1332,12 @@ def _after_model_load(model_patcher, *_) -> None:
         is_dynamic = False
     LOG.info(
         "SVDInt4 load state: reported %.2f MB, loaded %.2f MB, offload buffer %.2f MB, "
-        "packed %.2f MB, visible %.2f MB, dynamic %s, lowvram %s",
+        "packed %.2f MB, W4 storage %.2f MB, visible %.2f MB, dynamic %s, lowvram %s",
         _mb(model_patcher.model_size()),
         _mb(loaded_size),
         _mb(getattr(root, "model_offload_buffer_memory", 0)),
         _mb(getattr(root, "_svdint4_packed_bytes", 0)),
+        _mb(getattr(root, "_svdint4_w4_storage_bytes", 0)),
         _mb(getattr(root, "_svdint4_packed_state_bytes", 0)),
         is_dynamic,
         getattr(root, "model_lowvram", False),
@@ -1072,14 +1356,16 @@ def load_svdint4_model(
     _install_svdint4_patch_filter()
     _install_svdint4_lora_key_map()
     model_path = Path(model_path)
-    state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
+    state_dict, metadata, packed_layer_tensors, w4_layer_tensors = build_loader_state_dict(model_path)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
-    packed_state_bytes = packed_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
+    w4_storage_bytes = sum(_tensor_nbytes(tensor) for fields in w4_layer_tensors.values() for tensor in fields.values())
+    packed_state_bytes = packed_bytes + w4_storage_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
     unused_packed_layers: tuple[str, ...] = ()
+    unused_w4_layers: tuple[str, ...] = ()
     try:
         model = comfy.sd.load_diffusion_model_state_dict(
             state_dict,
-            model_options={"custom_operations": SVDInt4Ops(packed_layer_tensors)},
+            model_options={"custom_operations": SVDInt4Ops(packed_layer_tensors, w4_layer_tensors)},
             metadata=metadata,
             disable_dynamic=disable_dynamic,
         )
@@ -1087,6 +1373,9 @@ def load_svdint4_model(
         if packed_layer_tensors:
             unused_packed_layers = tuple(sorted(packed_layer_tensors))
             packed_layer_tensors.clear()
+        if w4_layer_tensors:
+            unused_w4_layers = tuple(sorted(w4_layer_tensors))
+            w4_layer_tensors.clear()
     if unused_packed_layers:
         sample = ", ".join(unused_packed_layers[:8])
         suffix = "" if len(unused_packed_layers) <= 8 else ", ..."
@@ -1094,9 +1383,17 @@ def load_svdint4_model(
             f"SVDInt4 model load left {len(unused_packed_layers)} packed Linear layer(s) unused "
             f"({sample}{suffix}). The file layout does not match the model architecture ComfyUI selected."
         )
+    if unused_w4_layers:
+        sample = ", ".join(unused_w4_layers[:8])
+        suffix = "" if len(unused_w4_layers) <= 8 else ", ..."
+        raise RuntimeError(
+            f"SVDInt4 model load left {len(unused_w4_layers)} W4 storage Linear layer(s) unused "
+            f"({sample}{suffix}). The file layout does not match the model architecture ComfyUI selected."
+        )
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.model._svdint4_packed_bytes = packed_bytes
+    model.model._svdint4_w4_storage_bytes = w4_storage_bytes
     model.model._svdint4_packed_state_bytes = packed_state_bytes
     model.model._svdint4_pending_adapter_lora_overlays = {}
     model._svdint4_pending_adapter_lora_overlays = {}
@@ -1119,9 +1416,14 @@ def load_svdint4_model(
     LOG.info(
         "SVDInt4 model accounting: base %.2f MB, packed %.2f MB, reported %.2f MB",
         _mb(base_size),
-        _mb(packed_bytes),
+        _mb(packed_bytes + w4_storage_bytes),
         _mb(model.size),
     )
+    if w4_storage_bytes:
+        LOG.info(
+            "SVDInt4 W4 storage: %.2f MB is kept packed on disk/device and dequantized to fp16 on demand.",
+            _mb(w4_storage_bytes),
+        )
     LOG.info(
         "SVDInt4 adapter LoRA overlay: automatic with on-demand staging; "
         "ComfyUI WeightAdapter h/g paths are reused, and dense diff/set patches "

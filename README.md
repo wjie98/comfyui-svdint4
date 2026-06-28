@@ -110,8 +110,17 @@ tensors:
   blocks.N.self_attn.q.smooth
   blocks.N.self_attn.q.bias_packed
   ...
+  transformer_blocks.N.img_mod.1.w4_qweight
+  transformer_blocks.N.img_mod.1.w4_scales
+  transformer_blocks.N.img_mod.1.bias
+  ...
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
+
+The optional `*.w4_qweight`/`*.w4_scales` layout is a storage-only W4 format
+for sensitive dense Linear weights. ComfyUI moves the packed weight and scales
+as QuantizedTensor state and dequantizes to FP16 only when the Linear is
+evaluated or when a dense weight patch needs a materialized weight.
 
 Only the `format` metadata is required in the weight file. Keep provenance,
 calibration notes, source paths, and experiment notes in a sidecar JSON if you
@@ -131,19 +140,20 @@ folder:
 packed-model/
   high/
     manifest.json
-    kept_fp16.safetensors
+    kept_mixed.safetensors
     block_00.safetensors
     ...
   low/
     manifest.json
-    kept_fp16.safetensors
+    kept_mixed.safetensors
     block_00.safetensors
     ...
 ```
 
 Convert each branch into one `.safetensors` file before using it in ComfyUI:
 
-1. Start with all tensors from `kept_fp16.safetensors`.
+1. Start with all tensors from `kept_mixed.safetensors` (`kept_fp16.safetensors`
+   in older packs).
 2. Read every `block_XX.safetensors` listed by `manifest.json`.
 3. Copy packed tensors into the same output file.
 4. Rename old SVD correction tensor keys:
@@ -184,6 +194,11 @@ ComfyUI can account for and move their qweight, scales, smooth factors, and SVD
 correction tensors together. The public `state_dict()` does not expose packed
 weights as normal `.weight` tensors, so standard ComfyUI LoRA patching does not
 accidentally treat them as dense fp16 weights.
+
+Storage-only W4 weights are also represented as QuantizedTensor weights, but
+they intentionally dequantize to ordinary FP16 Linear weights at use time. They
+are meant for layers where a compact checkpoint is useful but a dedicated W4
+kernel is not required.
 
 SVDInt4 DiT weights are loaded through ComfyUI's normal model patcher path.
 ComfyUI may keep the packed branch fully loaded or use its DynamicVRAM/offload
