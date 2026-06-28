@@ -795,13 +795,11 @@ def _install_svdint4_patch_filter() -> None:
 
         passthrough = {}
         handled = set()
-        enable_lora_adapters = bool(getattr(self.model, "_svdint4_enable_lora_adapters", False))
         pending = getattr(self.model, "_svdint4_pending_adapter_lora_overlays", None)
         if pending is None:
             pending = {}
             self.model._svdint4_pending_adapter_lora_overlays = pending
 
-        ignored = int(getattr(self.model, "_svdint4_ignored_adapter_lora_patch_count", 0))
         overlaid = int(getattr(self.model, "_svdint4_adapter_lora_overlay_count", 0))
         skipped = int(getattr(self.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
 
@@ -813,20 +811,16 @@ def _install_svdint4_patch_filter() -> None:
 
             handled.add(key)
             offset, function = _patch_key_offset_function(key)
-            if enable_lora_adapters and isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+            if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
                 pending.setdefault(weight_key, []).append(
                     (strength_patch, patch_data, strength_model, offset, function)
                 )
                 overlaid += 1
             else:
-                if enable_lora_adapters:
-                    skipped += 1
-                else:
-                    ignored += 1
+                skipped += 1
 
         patched = set(add_patches(self, passthrough, strength_patch, strength_model)) if passthrough else set()
         if handled:
-            self.model._svdint4_ignored_adapter_lora_patch_count = ignored
             self.model._svdint4_adapter_lora_overlay_count = overlaid
             self.model._svdint4_unsupported_adapter_lora_patch_count = skipped
             self.patches_uuid = uuid.uuid4()
@@ -866,7 +860,6 @@ def _install_svdint4_lora_key_map() -> None:
 
 
 def _attach_lora_adapter_overlays(model_patcher) -> None:
-    enable_lora_adapters = bool(getattr(model_patcher.model, "_svdint4_enable_lora_adapters", False))
     adapter_count = 0
     adapter_bytes = 0
     pending_overlays = getattr(model_patcher.model, "_svdint4_pending_adapter_lora_overlays", {}) or {}
@@ -875,7 +868,7 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
             continue
 
         overlays = pending_overlays.get(f"{name}.weight", [])
-        if enable_lora_adapters and overlays:
+        if overlays:
             prepared_overlays = []
             for strength_patch, patch_data, strength_model, offset, function in overlays:
                 if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
@@ -887,21 +880,11 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
             module._svdint4_adapter_lora_overlays = []
         adapter_count += len(overlays)
 
-    if not enable_lora_adapters:
-        ignored_count = int(getattr(model_patcher.model, "_svdint4_ignored_adapter_lora_patch_count", 0))
-        if ignored_count:
-            LOG.info(
-                "SVDInt4 ignored %d adapter LoRA patch(es) targeting packed Linear weights; "
-                "enable_lora_adapters to run them as fp16 adapter LoRA overlays",
-                ignored_count,
-            )
-        return
-
     if adapter_count:
         LOG.warning(
             "SVDInt4 attached %d adapter LoRA overlay patch(es), %.2f MB resident. "
             "Adapter overlays are separate fp16 matmul paths and are not fused into the SVDInt4 kernel; "
-            "disable enable_lora_adapters unless you intentionally need an external LoRA.",
+            "repack the model if a LoRA should become part of the quantized base.",
             adapter_count,
             _mb(adapter_bytes),
         )
@@ -928,20 +911,17 @@ def _after_model_load(model_patcher, *_) -> None:
 
 def _load_svdint4_model_cached(
     model_path: str | Path,
-    enable_lora_adapters: bool = False,
     disable_dynamic: bool = True,
 ):
     return load_svdint4_model(
         model_path,
         disable_dynamic=disable_dynamic,
-        enable_lora_adapters=enable_lora_adapters,
     )
 
 
 def load_svdint4_model(
     model_path: str | Path,
     disable_dynamic: bool = True,
-    enable_lora_adapters: bool = False,
 ):
     if not _HAS_COMFY_QUANTIZED_TENSOR:
         raise RuntimeError(
@@ -977,9 +957,7 @@ def load_svdint4_model(
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
     model.model._svdint4_packed_bytes = packed_bytes
     model.model._svdint4_packed_state_bytes = packed_state_bytes
-    model.model._svdint4_enable_lora_adapters = bool(enable_lora_adapters)
     model.model._svdint4_pending_adapter_lora_overlays = {}
-    model.model._svdint4_ignored_adapter_lora_patch_count = 0
     model.model._svdint4_adapter_lora_overlay_count = 0
     model.model._svdint4_unsupported_adapter_lora_patch_count = 0
     model.model._svdint4_metadata = metadata
@@ -1000,8 +978,7 @@ def load_svdint4_model(
         _mb(model.size),
     )
     LOG.info(
-        "SVDInt4 adapter LoRA overlay: %s; dense diff/set patches are unsupported for packed weights.",
-        "enabled" if model.model._svdint4_enable_lora_adapters else "disabled",
+        "SVDInt4 adapter LoRA overlay: automatic; dense diff/set patches are unsupported for packed weights."
     )
     if disable_dynamic:
         LOG.info(
@@ -1009,5 +986,5 @@ def load_svdint4_model(
             "DynamicVRAM staging is disabled for this model."
         )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
-    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters, disable_dynamic))
+    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), disable_dynamic))
     return model

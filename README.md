@@ -173,8 +173,7 @@ The script writes original metadata and basic provenance to
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`. The node exposes one adapter option:
-  `enable_lora_adapters`.
+  returns a ComfyUI `MODEL`.
 
 The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
@@ -202,11 +201,10 @@ SVDInt4/loaders
 The packed SVD residual correction tensors inside the model are part of the
 base quantized model and are not LoRA adapters. Standard LoRA patches targeting
 packed SVDInt4 Linear weights are kept out of ComfyUI's dense weight patch
-table. By default those adapter patches are ignored. Enable
-`enable_lora_adapters` only when you intentionally want compatible adapter
-LoRAs to run as fp16 overlays on top of the packed model. Dense `diff`/`set`
-weight patches are intentionally not supported for packed SVDInt4 weights.
-Repack the model when a LoRA is meant to become part of the quantized base.
+table. Compatible adapter LoRAs run automatically as fp16 overlays on top of
+the packed model. Dense `diff`/`set` weight patches are intentionally not
+supported for packed SVDInt4 weights. Repack the model when a LoRA is meant to
+become part of the quantized base.
 
 ## Smoke Tests
 

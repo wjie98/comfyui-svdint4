@@ -75,15 +75,6 @@ class SVDInt4DiffusionModelLoader:
                         )
                     },
                 ),
-                "enable_lora_adapters": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "Run compatible adapter LoRAs as fp16 overlays on top of packed SVDInt4 Linear layers."
-                        ),
-                    },
-                ),
             }
         }
 
@@ -96,11 +87,10 @@ class SVDInt4DiffusionModelLoader:
     def load_diffusion_model(
         self,
         unet_name: str,
-        enable_lora_adapters: bool = False,
     ):
         from .loader import load_svdint4_model
 
-        return (load_svdint4_model(_resolve_model_path(unet_name), enable_lora_adapters=enable_lora_adapters),)
+        return (load_svdint4_model(_resolve_model_path(unet_name)),)
 
 
 NODE_CLASS_MAPPINGS = {
