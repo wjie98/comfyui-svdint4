@@ -999,6 +999,8 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
 
 
 def _after_model_load(model_patcher, *_) -> None:
+    if SVDINT4_PROFILE:
+        _install_attention_profiler(model_patcher)
     _attach_lora_adapter_overlays(model_patcher)
     root = model_patcher.model
     LOG.info(
