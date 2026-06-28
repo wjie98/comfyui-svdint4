@@ -202,9 +202,11 @@ The packed SVD residual correction tensors inside the model are part of the
 base quantized model and are not LoRA adapters. Standard LoRA patches targeting
 packed SVDInt4 Linear weights are kept out of ComfyUI's dense weight patch
 table. Compatible adapter LoRAs run automatically as fp16 overlays on top of
-the packed model. Dense `diff`/`set` weight patches are intentionally not
-supported for packed SVDInt4 weights. Repack the model when a LoRA is meant to
-become part of the quantized base.
+the packed model. Adapter overlay tensors stay in CPU-owned storage and are
+staged into a small per-model GPU buffer layer by layer; they are still separate
+matmul paths, not fused SVDInt4 weights. Dense `diff`/`set` weight patches are
+intentionally not supported for packed SVDInt4 weights. Repack the model when a
+LoRA is meant to become part of the quantized base.
 
 ## Smoke Tests
 

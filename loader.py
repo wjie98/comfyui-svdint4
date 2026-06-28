@@ -236,18 +236,6 @@ def _mb(value: int | float) -> float:
     return float(value) / (1024 * 1024)
 
 
-def _adapter_weights_to(value, device: torch.device, dtype: torch.dtype):
-    if isinstance(value, torch.Tensor):
-        if value.dtype in (torch.float16, torch.bfloat16, torch.float32):
-            return value.to(device=device, dtype=dtype, non_blocking=True)
-        return value.to(device=device, non_blocking=True)
-    if isinstance(value, tuple):
-        return tuple(_adapter_weights_to(item, device, dtype) for item in value)
-    if isinstance(value, list):
-        return [_adapter_weights_to(item, device, dtype) for item in value]
-    return value
-
-
 def _adapter_weights_nbytes(value) -> int:
     if isinstance(value, torch.Tensor):
         return _tensor_nbytes(value)
@@ -258,8 +246,89 @@ def _adapter_weights_nbytes(value) -> int:
     return 0
 
 
-def _adapter_to_device(adapter: comfy.weight_adapter.WeightAdapterBase, device: torch.device, dtype: torch.dtype):
-    return type(adapter)(adapter.loaded_keys, _adapter_weights_to(adapter.weights, device, dtype))
+def _adapter_weights_to_staging_source(value, dtype: torch.dtype):
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            value = value.to(device="cpu", dtype=dtype)
+        elif value.device.type != "cpu":
+            value = value.to(device="cpu")
+        return value.contiguous().clone()
+    if isinstance(value, tuple):
+        return tuple(_adapter_weights_to_staging_source(item, dtype) for item in value)
+    if isinstance(value, list):
+        return [_adapter_weights_to_staging_source(item, dtype) for item in value]
+    return value
+
+
+def _adapter_to_staging_source(adapter: comfy.weight_adapter.WeightAdapterBase, dtype: torch.dtype):
+    if getattr(adapter, "_svdint4_staging_source_dtype", None) == dtype:
+        return adapter
+    staged = type(adapter)(adapter.loaded_keys, _adapter_weights_to_staging_source(adapter.weights, dtype))
+    staged._svdint4_staging_source_dtype = dtype
+    return staged
+
+
+def _adapter_staging_nbytes(adapter: comfy.weight_adapter.WeightAdapterBase) -> int:
+    counter = [0]
+    comfy.lora.prefetch_prepared_value(adapter, counter, None, None, False)
+    return int(counter[0])
+
+
+@dataclasses.dataclass(frozen=True)
+class SVDInt4AdapterOverlay:
+    strength_patch: float
+    patch_data: comfy.weight_adapter.WeightAdapterBase
+    strength_model: float
+    offset: object
+    function: object
+    staging_nbytes: int
+    source_nbytes: int
+
+
+class SVDInt4AdapterStagingRuntime:
+    """Per-model GPU staging buffer for SVDInt4 adapter overlays."""
+
+    def __init__(self):
+        self.buffer: torch.Tensor | None = None
+        self.buffer_size = 0
+        self.max_required = 0
+
+    def clear(self) -> None:
+        self.buffer = None
+        self.buffer_size = 0
+
+    def _ensure_buffer(self, device: torch.device, required: int) -> torch.Tensor:
+        if self.buffer is None or self.buffer.device != device or self.buffer_size < required:
+            self.buffer = torch.empty((required,), dtype=torch.uint8, device=device)
+            self.buffer_size = required
+        self.max_required = max(self.max_required, required)
+        return self.buffer
+
+    def prepare(self, overlays: list[SVDInt4AdapterOverlay], device: torch.device) -> list[SVDInt4AdapterOverlay]:
+        required = sum(overlay.staging_nbytes for overlay in overlays)
+        if required <= 0:
+            return overlays
+
+        buffer = self._ensure_buffer(device, required)
+        counter = [0]
+
+        prepared: list[SVDInt4AdapterOverlay] = []
+        for overlay in overlays:
+            patch_data = comfy.lora.prefetch_prepared_value(
+                overlay.patch_data,
+                counter,
+                buffer,
+                None,
+                True,
+            )
+            prepared.append(dataclasses.replace(overlay, patch_data=patch_data))
+
+        if counter[0] > required:
+            raise RuntimeError(
+                f"SVDInt4 adapter staging buffer was too small: prepared {counter[0]} bytes into {required} bytes"
+            )
+        return prepared
 
 
 @dataclasses.dataclass
@@ -512,7 +581,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         self.compute_dtype = COMPUTE_DTYPE
         self.packed_name = None
         self.packed_weight: SVDInt4PackedTensor | None = None
-        self._svdint4_adapter_lora_overlays = []
+        self._svdint4_adapter_lora_overlays: list[SVDInt4AdapterOverlay] = []
+        self._svdint4_adapter_staging_runtime: SVDInt4AdapterStagingRuntime | None = None
         self._svdint4_adapter_lora_warnings: set[str] = set()
 
     def _load_from_state_dict(
@@ -615,17 +685,21 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
         patches = self._svdint4_adapter_lora_overlays
         if not patches:
             return out
+        runtime = self._svdint4_adapter_staging_runtime
+        if runtime is not None:
+            patches = runtime.prepare(patches, x.device)
 
         result = out
-        for strength_patch, patch_data, strength_model, offset, function in patches:
-            if offset is not None:
+        for overlay in patches:
+            patch_data = overlay.patch_data
+            if overlay.offset is not None:
                 self._warn_adapter_lora_once(
                     "lora_offset",
                     "SVDInt4 adapter LoRA overlay skipped %s: offset patches are not supported",
                     getattr(self, "packed_name", "<unknown>"),
                 )
                 continue
-            if strength_model != 1.0:
+            if overlay.strength_model != 1.0:
                 self._warn_adapter_lora_once(
                     "lora_strength_model",
                     "SVDInt4 adapter LoRA overlay skipped %s: strength_model != 1 is not supported",
@@ -650,7 +724,7 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 "out_channels": getattr(patch_data, "out_channels", None),
             }
             try:
-                patch_data.multiplier = strength_patch
+                patch_data.multiplier = overlay.strength_patch
                 patch_data.is_conv = False
                 patch_data.conv_dim = 0
                 patch_data.kw_dict = {}
@@ -658,8 +732,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 patch_data.in_channels = self.in_features
                 patch_data.out_channels = self.out_features
                 delta = patch_data.h(x, result)
-                if function is not None:
-                    delta = function(delta)
+                if overlay.function is not None:
+                    delta = overlay.function(delta)
                 result = patch_data.g(result + delta.to(dtype=result.dtype))
             except Exception as exc:
                 self._warn_adapter_lora_once(
@@ -783,6 +857,31 @@ def _patch_key_offset_function(key):
     return offset, function
 
 
+def _ensure_patcher_lora_overlay_state(model_patcher) -> dict:
+    pending = getattr(model_patcher, "_svdint4_pending_adapter_lora_overlays", None)
+    if pending is None:
+        pending = {}
+        model_patcher._svdint4_pending_adapter_lora_overlays = pending
+        model_patcher._svdint4_adapter_lora_overlay_count = 0
+        model_patcher._svdint4_unsupported_adapter_lora_patch_count = 0
+    return pending
+
+
+def _clone_svdint4_lora_overlay_state(src_model_patcher, dst_model_patcher) -> None:
+    pending = getattr(src_model_patcher, "_svdint4_pending_adapter_lora_overlays", None)
+    if pending is not None:
+        dst_model_patcher._svdint4_pending_adapter_lora_overlays = {
+            key: overlays[:]
+            for key, overlays in pending.items()
+        }
+        dst_model_patcher._svdint4_adapter_lora_overlay_count = int(
+            getattr(src_model_patcher, "_svdint4_adapter_lora_overlay_count", 0)
+        )
+        dst_model_patcher._svdint4_unsupported_adapter_lora_patch_count = int(
+            getattr(src_model_patcher, "_svdint4_unsupported_adapter_lora_patch_count", 0)
+        )
+
+
 def _install_svdint4_patch_filter() -> None:
     add_patches = comfy.model_patcher.ModelPatcher.add_patches
     if getattr(add_patches, "_svdint4_filter_installed", False):
@@ -795,13 +894,10 @@ def _install_svdint4_patch_filter() -> None:
 
         passthrough = {}
         handled = set()
-        pending = getattr(self.model, "_svdint4_pending_adapter_lora_overlays", None)
-        if pending is None:
-            pending = {}
-            self.model._svdint4_pending_adapter_lora_overlays = pending
+        pending = _ensure_patcher_lora_overlay_state(self)
 
-        overlaid = int(getattr(self.model, "_svdint4_adapter_lora_overlay_count", 0))
-        skipped = int(getattr(self.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
+        overlaid = int(getattr(self, "_svdint4_adapter_lora_overlay_count", 0))
+        skipped = int(getattr(self, "_svdint4_unsupported_adapter_lora_patch_count", 0))
 
         for key, patch_data in patches.items():
             weight_key = _patch_key_name(key)
@@ -812,6 +908,7 @@ def _install_svdint4_patch_filter() -> None:
             handled.add(key)
             offset, function = _patch_key_offset_function(key)
             if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+                patch_data = _adapter_to_staging_source(patch_data, COMPUTE_DTYPE)
                 pending.setdefault(weight_key, []).append(
                     (strength_patch, patch_data, strength_model, offset, function)
                 )
@@ -821,8 +918,8 @@ def _install_svdint4_patch_filter() -> None:
 
         patched = set(add_patches(self, passthrough, strength_patch, strength_model)) if passthrough else set()
         if handled:
-            self.model._svdint4_adapter_lora_overlay_count = overlaid
-            self.model._svdint4_unsupported_adapter_lora_patch_count = skipped
+            self._svdint4_adapter_lora_overlay_count = overlaid
+            self._svdint4_unsupported_adapter_lora_patch_count = skipped
             self.patches_uuid = uuid.uuid4()
             patched.update(handled)
         return list(patched)
@@ -861,8 +958,17 @@ def _install_svdint4_lora_key_map() -> None:
 
 def _attach_lora_adapter_overlays(model_patcher) -> None:
     adapter_count = 0
-    adapter_bytes = 0
-    pending_overlays = getattr(model_patcher.model, "_svdint4_pending_adapter_lora_overlays", {}) or {}
+    adapter_source_bytes = 0
+    adapter_staging_bytes = 0
+    max_layer_staging_bytes = 0
+    pending_overlays = getattr(model_patcher, "_svdint4_pending_adapter_lora_overlays", None)
+    if pending_overlays is None:
+        pending_overlays = getattr(model_patcher.model, "_svdint4_pending_adapter_lora_overlays", {}) or {}
+    runtime = getattr(model_patcher.model, "_svdint4_adapter_staging_runtime", None)
+    if runtime is None:
+        runtime = SVDInt4AdapterStagingRuntime()
+        model_patcher.model._svdint4_adapter_staging_runtime = runtime
+
     for name, module in model_patcher.model.named_modules():
         if not getattr(module, "is_svdint4", False):
             continue
@@ -870,31 +976,64 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
         overlays = pending_overlays.get(f"{name}.weight", [])
         if overlays:
             prepared_overlays = []
+            layer_staging_bytes = 0
             for strength_patch, patch_data, strength_model, offset, function in overlays:
                 if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
-                    patch_data = _adapter_to_device(patch_data, module.weight.device, module.compute_dtype)
-                    adapter_bytes += _adapter_weights_nbytes(patch_data.weights)
-                prepared_overlays.append((strength_patch, patch_data, strength_model, offset, function))
+                    patch_data = _adapter_to_staging_source(patch_data, module.compute_dtype)
+                    source_nbytes = _adapter_weights_nbytes(patch_data.weights)
+                    staging_nbytes = _adapter_staging_nbytes(patch_data)
+                    adapter_source_bytes += source_nbytes
+                    adapter_staging_bytes += staging_nbytes
+                    layer_staging_bytes += staging_nbytes
+                    prepared_overlays.append(
+                        SVDInt4AdapterOverlay(
+                            strength_patch=strength_patch,
+                            patch_data=patch_data,
+                            strength_model=strength_model,
+                            offset=offset,
+                            function=function,
+                            staging_nbytes=staging_nbytes,
+                            source_nbytes=source_nbytes,
+                        )
+                    )
             module._svdint4_adapter_lora_overlays = prepared_overlays
+            module._svdint4_adapter_staging_runtime = runtime
+            max_layer_staging_bytes = max(max_layer_staging_bytes, layer_staging_bytes)
         else:
             module._svdint4_adapter_lora_overlays = []
+            module._svdint4_adapter_staging_runtime = runtime
         adapter_count += len(overlays)
 
     if adapter_count:
         LOG.warning(
-            "SVDInt4 attached %d adapter LoRA overlay patch(es), %.2f MB resident. "
-            "Adapter overlays are separate fp16 matmul paths and are not fused into the SVDInt4 kernel; "
+            "SVDInt4 attached %d adapter LoRA overlay patch(es), %.2f MB CPU source, "
+            "%.2f MB total staged bytes, %.2f MB max per-layer GPU staging buffer. "
+            "Adapter overlays are staged on demand as separate fp16 matmul paths and are not fused into the SVDInt4 kernel; "
             "repack the model if a LoRA should become part of the quantized base.",
             adapter_count,
-            _mb(adapter_bytes),
+            _mb(adapter_source_bytes),
+            _mb(adapter_staging_bytes),
+            _mb(max_layer_staging_bytes),
         )
-    skipped_count = int(getattr(model_patcher.model, "_svdint4_unsupported_adapter_lora_patch_count", 0))
+    skipped_count = int(
+        getattr(
+            model_patcher,
+            "_svdint4_unsupported_adapter_lora_patch_count",
+            getattr(model_patcher.model, "_svdint4_unsupported_adapter_lora_patch_count", 0),
+        )
+    )
     if skipped_count:
         LOG.warning(
             "SVDInt4 ignored %d non-adapter patch(es) targeting packed Linear weights; "
             "dense diff/set patches are unsupported for packed weights",
             skipped_count,
         )
+
+
+def _clear_adapter_staging_runtime(model_patcher, *_) -> None:
+    runtime = getattr(model_patcher.model, "_svdint4_adapter_staging_runtime", None)
+    if runtime is not None:
+        runtime.clear()
 
 
 def _after_model_load(model_patcher, *_) -> None:
@@ -958,8 +1097,12 @@ def load_svdint4_model(
     model.model._svdint4_packed_bytes = packed_bytes
     model.model._svdint4_packed_state_bytes = packed_state_bytes
     model.model._svdint4_pending_adapter_lora_overlays = {}
+    model._svdint4_pending_adapter_lora_overlays = {}
+    model._svdint4_adapter_lora_overlay_count = 0
+    model._svdint4_unsupported_adapter_lora_patch_count = 0
     model.model._svdint4_adapter_lora_overlay_count = 0
     model.model._svdint4_unsupported_adapter_lora_patch_count = 0
+    model.model._svdint4_adapter_staging_runtime = SVDInt4AdapterStagingRuntime()
     model.model._svdint4_metadata = metadata
     packed_weight_keys = set()
     for name, module in model.model.named_modules():
@@ -978,7 +1121,8 @@ def load_svdint4_model(
         _mb(model.size),
     )
     LOG.info(
-        "SVDInt4 adapter LoRA overlay: automatic; dense diff/set patches are unsupported for packed weights."
+        "SVDInt4 adapter LoRA overlay: automatic with on-demand staging; "
+        "dense diff/set patches are unsupported for packed weights."
     )
     if disable_dynamic:
         LOG.info(
@@ -986,5 +1130,8 @@ def load_svdint4_model(
             "DynamicVRAM staging is disabled for this model."
         )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
+    model.add_callback(CallbacksMP.ON_CLONE, _clone_svdint4_lora_overlay_state)
+    model.add_callback(CallbacksMP.ON_DETACH, _clear_adapter_staging_runtime)
+    model.add_callback(CallbacksMP.ON_CLEANUP, _clear_adapter_staging_runtime)
     model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), disable_dynamic))
     return model
