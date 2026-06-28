@@ -111,22 +111,23 @@ class SVDInt4DiffusionModelLoader:
 class BerniniPadVideoLength:
     @classmethod
     def INPUT_TYPES(cls):
+        target_frame_count = (
+            "INT",
+            {
+                "default": 0,
+                "min": 0,
+                "max": 16385,
+                "step": 1,
+                "tooltip": (
+                    "Target real-frame count. Use 0 to round the input length up "
+                    "to the next 4*n+1 frame count."
+                ),
+            },
+        )
         return {
             "required": {
                 "image": ("IMAGE",),
-                "target_frame_count": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 16385,
-                        "step": 1,
-                        "tooltip": (
-                            "Target real-frame count. Use 0 to round the input length up "
-                            "to the next 4*n+1 frame count."
-                        ),
-                    },
-                ),
+                "target_frame_count": target_frame_count,
             }
         }
 
