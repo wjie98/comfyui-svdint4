@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 from pathlib import Path
 
 import comfy.context_windows
@@ -112,8 +113,8 @@ class BerniniPadVideoLength:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video": ("IMAGE",),
-                "target_length": (
+                "image": ("IMAGE",),
+                "target_frame_count": (
                     "INT",
                     {
                         "default": 0,
@@ -130,40 +131,40 @@ class BerniniPadVideoLength:
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("video", "length", "input_length", "width", "height")
+    RETURN_NAMES = ("image", "width", "height", "length", "target_length")
     FUNCTION = "pad"
     CATEGORY = "SVDInt4/video"
     TITLE = "Bernini Pad Video Length"
 
-    def pad(self, video, target_length: int):
-        if video.ndim < 3:
-            raise ValueError(f"Expected IMAGE tensor shaped [frames, height, width, channels], got {tuple(video.shape)}.")
-        frame_count = int(video.shape[0])
+    def pad(self, image, target_frame_count: int):
+        if image.ndim < 3:
+            raise ValueError(f"Expected IMAGE tensor shaped [frames, height, width, channels], got {tuple(image.shape)}.")
+        frame_count = int(image.shape[0])
         if frame_count < 1:
             raise ValueError("Bernini Pad Video Length requires at least one input frame.")
-        height = int(video.shape[1])
-        width = int(video.shape[2])
+        height = int(image.shape[1])
+        width = int(image.shape[2])
 
-        if target_length == 0:
+        if target_frame_count == 0:
             output_length = _ceil_wan_frame_count(frame_count)
         else:
-            output_length = int(target_length)
+            output_length = int(target_frame_count)
             if not _is_wan_frame_count(output_length):
                 raise ValueError(
-                    f"target_length must be 0 or 4*n+1; got {target_length}."
+                    f"target_frame_count must be 0 or 4*n+1; got {target_frame_count}."
                 )
             if output_length < frame_count:
                 raise ValueError(
-                    f"target_length={output_length} is shorter than the input video "
+                    f"target_frame_count={output_length} is shorter than the input video "
                     f"({frame_count} frames). This node only pads; trim upstream if needed."
                 )
 
         pad_count = output_length - frame_count
         if pad_count <= 0:
-            return (video, output_length, frame_count, width, height)
+            return (image, width, height, frame_count, output_length)
 
-        tail = video[-1:].repeat(pad_count, *([1] * (video.ndim - 1)))
-        return (torch.cat((video, tail), dim=0), output_length, frame_count, width, height)
+        tail = image[-1:].repeat(pad_count, *([1] * (image.ndim - 1)))
+        return (torch.cat((image, tail), dim=0), width, height, frame_count, output_length)
 
 
 def _window_start_and_stride(window, use_causal_anchor: bool) -> tuple[float, float]:
@@ -225,6 +226,16 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
     new_transformer_options["rope_options"] = rope_options
     args, kwargs = _with_transformer_options(args, kwargs, new_transformer_options)
     return executor(*args, **kwargs)
+
+
+def _make_context_handler(**kwargs):
+    params = inspect.signature(comfy.context_windows.IndexListContextHandler).parameters
+    if kwargs.get("causal_window_fix", False) and "causal_window_fix" not in params:
+        LOG.warning("Current ComfyUI does not support context window causal_window_fix; ignoring it.")
+    if kwargs.get("split_conds_to_windows", False) and "split_conds_to_windows" not in params:
+        LOG.warning("Current ComfyUI does not support split_conds_to_windows; ignoring it.")
+    supported_kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return comfy.context_windows.IndexListContextHandler(**supported_kwargs)
 
 
 class BerniniContextWindowsCore:
@@ -314,7 +325,7 @@ class BerniniContextWindowsCore:
             latent_context_overlap = min(latent_context_overlap, latent_context_length - 1)
 
         patched = model.clone()
-        patched.model_options["context_handler"] = comfy.context_windows.IndexListContextHandler(
+        patched.model_options["context_handler"] = _make_context_handler(
             context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
             fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
             context_length=latent_context_length,
