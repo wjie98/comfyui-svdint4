@@ -292,7 +292,6 @@ class SVDInt4AdapterStagingRuntime:
     def __init__(self):
         self.buffer: torch.Tensor | None = None
         self.buffer_size = 0
-        self.max_required = 0
 
     def clear(self) -> None:
         self.buffer = None
@@ -302,7 +301,6 @@ class SVDInt4AdapterStagingRuntime:
         if self.buffer is None or self.buffer.device != device or self.buffer_size < required:
             self.buffer = torch.empty((required,), dtype=torch.uint8, device=device)
             self.buffer_size = required
-        self.max_required = max(self.max_required, required)
         return self.buffer
 
     def prepare(self, overlays: list[SVDInt4AdapterOverlay], device: torch.device) -> list[SVDInt4AdapterOverlay]:
@@ -1062,16 +1060,6 @@ def _after_model_load(model_patcher, *_) -> None:
     )
 
 
-def _load_svdint4_model_cached(
-    model_path: str | Path,
-    disable_dynamic: bool = False,
-):
-    return load_svdint4_model(
-        model_path,
-        disable_dynamic=disable_dynamic,
-    )
-
-
 def load_svdint4_model(
     model_path: str | Path,
     disable_dynamic: bool = False,
@@ -1149,5 +1137,5 @@ def load_svdint4_model(
     model.add_callback(CallbacksMP.ON_CLONE, _clone_svdint4_lora_overlay_state)
     model.add_callback(CallbacksMP.ON_DETACH, _clear_adapter_staging_runtime)
     model.add_callback(CallbacksMP.ON_CLEANUP, _clear_adapter_staging_runtime)
-    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path),))
+    model.cached_patcher_init = (load_svdint4_model, (str(model_path),))
     return model
