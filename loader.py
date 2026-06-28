@@ -908,6 +908,8 @@ def _install_svdint4_patch_filter() -> None:
             handled.add(key)
             offset, function = _patch_key_offset_function(key)
             if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase):
+                # Keep ComfyUI's adapter implementation, but route packed weights
+                # away from dense patching because their .weight is not fp16.
                 patch_data = _adapter_to_staging_source(patch_data, COMPUTE_DTYPE)
                 pending.setdefault(weight_key, []).append(
                     (strength_patch, patch_data, strength_model, offset, function)
@@ -1039,18 +1041,30 @@ def _clear_adapter_staging_runtime(model_patcher, *_) -> None:
 def _after_model_load(model_patcher, *_) -> None:
     _attach_lora_adapter_overlays(model_patcher)
     root = model_patcher.model
+    try:
+        loaded_size = model_patcher.loaded_size()
+    except Exception:
+        loaded_size = getattr(root, "model_loaded_weight_memory", 0)
+    try:
+        is_dynamic = model_patcher.is_dynamic()
+    except Exception:
+        is_dynamic = False
     LOG.info(
-        "SVDInt4 load state: reported %.2f MB, loaded %.2f MB, packed %.2f MB, visible %.2f MB",
+        "SVDInt4 load state: reported %.2f MB, loaded %.2f MB, offload buffer %.2f MB, "
+        "packed %.2f MB, visible %.2f MB, dynamic %s, lowvram %s",
         _mb(model_patcher.model_size()),
-        _mb(getattr(root, "model_loaded_weight_memory", 0)),
+        _mb(loaded_size),
+        _mb(getattr(root, "model_offload_buffer_memory", 0)),
         _mb(getattr(root, "_svdint4_packed_bytes", 0)),
         _mb(getattr(root, "_svdint4_packed_state_bytes", 0)),
+        is_dynamic,
+        getattr(root, "model_lowvram", False),
     )
 
 
 def _load_svdint4_model_cached(
     model_path: str | Path,
-    disable_dynamic: bool = True,
+    disable_dynamic: bool = False,
 ):
     return load_svdint4_model(
         model_path,
@@ -1060,7 +1074,7 @@ def _load_svdint4_model_cached(
 
 def load_svdint4_model(
     model_path: str | Path,
-    disable_dynamic: bool = True,
+    disable_dynamic: bool = False,
 ):
     if not _HAS_COMFY_QUANTIZED_TENSOR:
         raise RuntimeError(
@@ -1122,16 +1136,18 @@ def load_svdint4_model(
     )
     LOG.info(
         "SVDInt4 adapter LoRA overlay: automatic with on-demand staging; "
-        "dense diff/set patches are unsupported for packed weights."
+        "ComfyUI WeightAdapter h/g paths are reused, and dense diff/set patches "
+        "are unsupported for packed weights."
     )
-    if disable_dynamic:
-        LOG.info(
-            "SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; "
-            "DynamicVRAM staging is disabled for this model."
-        )
+    LOG.info(
+        "SVDInt4 weight management: ComfyUI-managed QuantizedTensor weights; "
+        "DynamicVRAM allowed: %s; patcher dynamic: %s.",
+        not disable_dynamic,
+        model.is_dynamic(),
+    )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
     model.add_callback(CallbacksMP.ON_CLONE, _clone_svdint4_lora_overlay_state)
     model.add_callback(CallbacksMP.ON_DETACH, _clear_adapter_staging_runtime)
     model.add_callback(CallbacksMP.ON_CLEANUP, _clear_adapter_staging_runtime)
-    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), disable_dynamic))
+    model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path),))
     return model

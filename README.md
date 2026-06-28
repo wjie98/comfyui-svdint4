@@ -179,16 +179,17 @@ The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
 
-Packed SVDInt4 weights are represented as ComfyUI QuantizedTensor
-weights so ComfyUI can account for and move their qweight, scales, smooth
-factors, and SVD correction tensors together. The public `state_dict()` does not expose
-packed weights as normal `.weight` tensors, so standard ComfyUI LoRA patching
-does not accidentally treat them as dense fp16 weights.
+Packed SVDInt4 weights are represented as ComfyUI QuantizedTensor weights so
+ComfyUI can account for and move their qweight, scales, smooth factors, and SVD
+correction tensors together. The public `state_dict()` does not expose packed
+weights as normal `.weight` tensors, so standard ComfyUI LoRA patching does not
+accidentally treat them as dense fp16 weights.
 
-SVDInt4 DiT weights are loaded through ComfyUI's resident ModelPatcher path by
-default. This avoids DynamicVRAM staging every packed Linear layer during the
-first denoise step, which is usually slower than one full packed-branch upload
-for 480p Wan/Bernini workflows on 11GB or larger NVIDIA cards.
+SVDInt4 DiT weights are loaded through ComfyUI's normal model patcher path.
+ComfyUI may keep the packed branch fully loaded or use its DynamicVRAM/offload
+logic depending on the current workflow and available VRAM. The loader only
+defines the QuantizedTensor layout and packed Linear execution; it does not
+force a separate loading policy.
 
 The node category is:
 
@@ -203,10 +204,11 @@ base quantized model and are not LoRA adapters. Standard LoRA patches targeting
 packed SVDInt4 Linear weights are kept out of ComfyUI's dense weight patch
 table. Compatible adapter LoRAs run automatically as fp16 overlays on top of
 the packed model. Adapter overlay tensors stay in CPU-owned storage and are
-staged into a small per-model GPU buffer layer by layer; they are still separate
-matmul paths, not fused SVDInt4 weights. Dense `diff`/`set` weight patches are
-intentionally not supported for packed SVDInt4 weights. Repack the model when a
-LoRA is meant to become part of the quantized base.
+staged into a small per-model GPU buffer layer by layer. The overlay reuses
+ComfyUI's `WeightAdapter` h/g tensors; it is still a separate fp16 matmul path,
+not fused SVDInt4 weight. Dense `diff`/`set` weight patches are intentionally
+not supported for packed SVDInt4 weights. Repack the model when a LoRA is meant
+to become part of the quantized base.
 
 ## Smoke Tests
 
