@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import importlib
 import logging
 import os
 import uuid
@@ -44,6 +46,14 @@ SVDINT4_STATE_PREFIX = "svdint4_"
 SVDINT4_PROFILE = os.environ.get("SVDINT4_PROFILE", "").lower() in {"1", "true", "yes", "on"}
 SVDINT4_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_PROFILE_INTERVAL", "200")))
 SVDINT4_ATTENTION_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_ATTENTION_PROFILE_INTERVAL", "40")))
+SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER = "_svdint4_direct_attention_profile"
+SVDINT4_DIRECT_ATTENTION_MODULES = (
+    "comfy.ldm.wan.model",
+    "comfy.ldm.wan.ar_model",
+    "comfy.ldm.wan.model_multitalk",
+    "comfy.ldm.wan.model_animate",
+    "comfy.ldm.wan.model_wandancer",
+)
 _SVDINT4_PROFILE_STATS: dict[str, dict[str, object]] = {}
 _SVDINT4_PROFILE_CALLS = 0
 _SVDINT4_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
@@ -331,6 +341,42 @@ def _profile_attention_call(func, *args, **kwargs):
     return out
 
 
+def _profile_direct_attention_call(func, *args, **kwargs):
+    name, shape = _attention_profile_key(func, args, kwargs)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    profiled_kwargs = dict(kwargs)
+    profiled_kwargs[SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER] = True
+    start.record()
+    out = func(*args, **profiled_kwargs)
+    end.record()
+    _record_svdint4_attention_profile(name, start, end, shape)
+    return out
+
+
+def _install_direct_attention_profiler() -> None:
+    installed = []
+    for module_name in SVDINT4_DIRECT_ATTENTION_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        current = getattr(module, "optimized_attention", None)
+        if current is None or getattr(current, "_svdint4_direct_attention_profile_installed", False):
+            continue
+
+        @functools.wraps(current)
+        def profiled_attention(*args, _svdint4_attention_func=current, **kwargs):
+            return _profile_direct_attention_call(_svdint4_attention_func, *args, **kwargs)
+
+        profiled_attention._svdint4_direct_attention_profile_installed = True
+        module.optimized_attention = profiled_attention
+        installed.append(module_name)
+
+    if installed:
+        LOG.info("SVDInt4 direct Wan attention profiler installed for: %s", ", ".join(installed))
+
+
 def _install_attention_profiler(model_patcher) -> None:
     transformer_options = model_patcher.model_options.setdefault("transformer_options", {})
     existing_override = transformer_options.get("optimized_attention_override")
@@ -339,9 +385,13 @@ def _install_attention_profiler(model_patcher) -> None:
 
     if existing_override is None:
         def profile_override(func, *args, **kwargs):
+            if kwargs.get(SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER, False):
+                return func(*args, **kwargs)
             return _profile_attention_call(func, *args, **kwargs)
     else:
         def profile_override(func, *args, **kwargs):
+            if kwargs.get(SVDINT4_DIRECT_ATTENTION_PROFILE_MARKER, False):
+                return existing_override(func, *args, **kwargs)
             return _profile_attention_call(lambda *a, **kw: existing_override(func, *a, **kw), *args, **kwargs)
 
     profile_override._svdint4_attention_profile_installed = True
@@ -1000,6 +1050,7 @@ def _attach_lora_adapter_overlays(model_patcher) -> None:
 
 def _after_model_load(model_patcher, *_) -> None:
     if SVDINT4_PROFILE:
+        _install_direct_attention_profiler()
         _install_attention_profiler(model_patcher)
     _attach_lora_adapter_overlays(model_patcher)
     root = model_patcher.model
@@ -1080,6 +1131,7 @@ def load_svdint4_model(
     if disable_dynamic:
         LOG.info("SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; DynamicVRAM staging is disabled for this model.")
     if SVDINT4_PROFILE:
+        _install_direct_attention_profiler()
         _install_attention_profiler(model)
         LOG.warning(
             "SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls "
