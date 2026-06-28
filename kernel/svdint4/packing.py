@@ -7,7 +7,7 @@ import torch
 
 SVDINT4_METADATA_CONTRACT_VERSION = "1"
 SVDINT4_DEFAULT_METADATA = {
-    "format": "svdint4-dit-safetensors-v1",
+    "format": "svdint4-dit-single-v2",
     "svdint4_contract_version": SVDINT4_METADATA_CONTRACT_VERSION,
     "has_svd_correction": "true",
 }
