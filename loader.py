@@ -43,9 +43,13 @@ SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
 SVDINT4_PROFILE = os.environ.get("SVDINT4_PROFILE", "").lower() in {"1", "true", "yes", "on"}
 SVDINT4_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_PROFILE_INTERVAL", "200")))
+SVDINT4_ATTENTION_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_ATTENTION_PROFILE_INTERVAL", "40")))
 _SVDINT4_PROFILE_STATS: dict[str, dict[str, object]] = {}
 _SVDINT4_PROFILE_CALLS = 0
 _SVDINT4_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
+_SVDINT4_ATTENTION_PROFILE_STATS: dict[str, dict[str, object]] = {}
+_SVDINT4_ATTENTION_PROFILE_CALLS = 0
+_SVDINT4_ATTENTION_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
 
 
 def _kernel_install_hint() -> str:
@@ -206,6 +210,95 @@ def _flush_svdint4_profile() -> None:
         total_ms / 1000.0,
         summary,
     )
+
+
+def _attention_profile_key(func, args, kwargs) -> tuple[str, tuple[int, ...]]:
+    q = args[0]
+    k = args[1]
+    heads = kwargs.get("heads", args[3] if len(args) > 3 else None)
+    skip_reshape = kwargs.get("skip_reshape", False)
+    if skip_reshape:
+        q_tokens = int(q.shape[-2])
+        k_tokens = int(k.shape[-2])
+        dim_head = int(q.shape[-1])
+    else:
+        q_tokens = int(q.shape[1])
+        k_tokens = int(k.shape[1])
+        dim_head = int(q.shape[-1] // heads) if heads else int(q.shape[-1])
+    shape = (q_tokens, k_tokens, int(heads) if heads else -1, dim_head)
+    func_name = getattr(func, "__name__", "attention")
+    if q_tokens == k_tokens:
+        attn_kind = "self"
+    elif k_tokens <= 512:
+        attn_kind = "cross_text_or_img"
+    else:
+        attn_kind = "cross"
+    return f"{func_name}:{attn_kind}:q{q_tokens}:k{k_tokens}:h{heads}:d{dim_head}", shape
+
+
+def _record_svdint4_attention_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, shape: tuple[int, ...]) -> None:
+    global _SVDINT4_ATTENTION_PROFILE_CALLS
+    _SVDINT4_ATTENTION_PROFILE_CALLS += 1
+    _SVDINT4_ATTENTION_PROFILE_PENDING.append((name, start, end, shape))
+    if _SVDINT4_ATTENTION_PROFILE_CALLS % SVDINT4_ATTENTION_PROFILE_INTERVAL != 0:
+        return
+
+    _flush_svdint4_attention_profile()
+
+
+def _flush_svdint4_attention_profile() -> None:
+    if not _SVDINT4_ATTENTION_PROFILE_PENDING:
+        return
+
+    _SVDINT4_ATTENTION_PROFILE_PENDING[-1][2].synchronize()
+    for name, start, end, shape in _SVDINT4_ATTENTION_PROFILE_PENDING:
+        elapsed_ms = start.elapsed_time(end)
+        stats = _SVDINT4_ATTENTION_PROFILE_STATS.setdefault(name, {"calls": 0, "ms": 0.0, "shape": shape})
+        stats["calls"] = int(stats["calls"]) + 1
+        stats["ms"] = float(stats["ms"]) + elapsed_ms
+        stats["shape"] = shape
+    _SVDINT4_ATTENTION_PROFILE_PENDING.clear()
+
+    total_ms = sum(float(item["ms"]) for item in _SVDINT4_ATTENTION_PROFILE_STATS.values())
+    top = sorted(_SVDINT4_ATTENTION_PROFILE_STATS.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
+    summary = "; ".join(
+        f"{name}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
+        for name, item in top
+    )
+    LOG.info(
+        "SVDInt4 attention profile after %d attention calls: total %.2fs; %s",
+        _SVDINT4_ATTENTION_PROFILE_CALLS,
+        total_ms / 1000.0,
+        summary,
+    )
+
+
+def _profile_attention_call(func, *args, **kwargs):
+    name, shape = _attention_profile_key(func, args, kwargs)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    out = func(*args, **kwargs)
+    end.record()
+    _record_svdint4_attention_profile(name, start, end, shape)
+    return out
+
+
+def _install_attention_profiler(model_patcher) -> None:
+    transformer_options = model_patcher.model_options.setdefault("transformer_options", {})
+    existing_override = transformer_options.get("optimized_attention_override")
+    if getattr(existing_override, "_svdint4_attention_profile_installed", False):
+        return
+
+    if existing_override is None:
+        def profile_override(func, *args, **kwargs):
+            return _profile_attention_call(func, *args, **kwargs)
+    else:
+        def profile_override(func, *args, **kwargs):
+            return _profile_attention_call(lambda *a, **kw: existing_override(func, *a, **kw), *args, **kwargs)
+
+    profile_override._svdint4_attention_profile_installed = True
+    transformer_options["optimized_attention_override"] = profile_override
 
 
 @dataclasses.dataclass
@@ -917,7 +1010,12 @@ def load_svdint4_model(
     if disable_dynamic:
         LOG.info("SVDInt4 uses ComfyUI-managed resident QuantizedTensor weights; DynamicVRAM staging is disabled for this model.")
     if SVDINT4_PROFILE:
-        LOG.warning("SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls.", SVDINT4_PROFILE_INTERVAL)
+        _install_attention_profiler(model)
+        LOG.warning(
+            "SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls and every %d attention calls.",
+            SVDINT4_PROFILE_INTERVAL,
+            SVDINT4_ATTENTION_PROFILE_INTERVAL,
+        )
     model.add_callback(CallbacksMP.ON_LOAD, _after_model_load)
     model.cached_patcher_init = (_load_svdint4_model_cached, (str(model_path), enable_lora_adapters))
     return model
