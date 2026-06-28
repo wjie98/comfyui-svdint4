@@ -129,16 +129,20 @@ class BerniniPadVideoLength:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT")
-    RETURN_NAMES = ("video", "length", "input_length")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("video", "length", "input_length", "width", "height")
     FUNCTION = "pad"
     CATEGORY = "SVDInt4/video"
     TITLE = "Bernini Pad Video Length"
 
     def pad(self, video, target_length: int):
+        if video.ndim < 3:
+            raise ValueError(f"Expected IMAGE tensor shaped [frames, height, width, channels], got {tuple(video.shape)}.")
         frame_count = int(video.shape[0])
         if frame_count < 1:
             raise ValueError("Bernini Pad Video Length requires at least one input frame.")
+        height = int(video.shape[1])
+        width = int(video.shape[2])
 
         if target_length == 0:
             output_length = _ceil_wan_frame_count(frame_count)
@@ -156,10 +160,10 @@ class BerniniPadVideoLength:
 
         pad_count = output_length - frame_count
         if pad_count <= 0:
-            return (video, output_length, frame_count)
+            return (video, output_length, frame_count, width, height)
 
         tail = video[-1:].repeat(pad_count, *([1] * (video.ndim - 1)))
-        return (torch.cat((video, tail), dim=0), output_length, frame_count)
+        return (torch.cat((video, tail), dim=0), output_length, frame_count, width, height)
 
 
 def _window_start_and_stride(window, use_causal_anchor: bool) -> tuple[float, float]:
@@ -288,7 +292,7 @@ class BerniniContextWindowsCore:
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"
     CATEGORY = "SVDInt4/patches"
-    TITLE = "Bernini Context Windows (Core MODEL)"
+    TITLE = "Bernini Context Windows"
 
     def apply(
         self,
@@ -351,7 +355,7 @@ class BerniniContextWindowsCore:
         )
 
         LOG.info(
-            "Bernini core context windows enabled: %s real frames -> %s latent frames, "
+            "Bernini context windows enabled: %s real frames -> %s latent frames, "
             "%s real overlap -> %s latent overlap, schedule=%s, fuse=%s",
             context_length,
             latent_context_length,
@@ -372,5 +376,5 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SVDInt4DiffusionModelLoader": "Load SVDInt4 DiT",
     "SVDInt4BerniniPadVideoLength": "Bernini Pad Video Length",
-    "SVDInt4BerniniContextWindowsCore": "Bernini Context Windows (Core MODEL)",
+    "SVDInt4BerniniContextWindowsCore": "Bernini Context Windows",
 }
