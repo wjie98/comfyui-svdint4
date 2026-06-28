@@ -47,6 +47,12 @@ SVDINT4_ATTENTION_PROFILE_INTERVAL = max(1, int(os.environ.get("SVDINT4_ATTENTIO
 _SVDINT4_PROFILE_STATS: dict[str, dict[str, object]] = {}
 _SVDINT4_PROFILE_CALLS = 0
 _SVDINT4_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
+_SVDINT4_BASE_PROFILE_STATS: dict[str, dict[str, object]] = {}
+_SVDINT4_BASE_PROFILE_CALLS = 0
+_SVDINT4_BASE_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
+_SVDINT4_ADAPTER_PROFILE_STATS: dict[str, dict[str, object]] = {}
+_SVDINT4_ADAPTER_PROFILE_CALLS = 0
+_SVDINT4_ADAPTER_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
 _SVDINT4_ATTENTION_PROFILE_STATS: dict[str, dict[str, object]] = {}
 _SVDINT4_ATTENTION_PROFILE_CALLS = 0
 _SVDINT4_ATTENTION_PROFILE_PENDING: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]] = []
@@ -175,6 +181,41 @@ def _adapter_to_device(adapter: comfy.weight_adapter.WeightAdapterBase, device: 
     return type(adapter)(adapter.loaded_keys, _adapter_weights_to(adapter.weights, device, dtype))
 
 
+def _flush_cuda_event_profile(
+    pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event, tuple[int, ...]]],
+    stats_by_name: dict[str, dict[str, object]],
+    call_count: int,
+    label: str,
+    call_unit: str,
+) -> None:
+    if not pending:
+        return
+
+    pending[-1][2].synchronize()
+    for name, start, end, shape in pending:
+        elapsed_ms = start.elapsed_time(end)
+        stats = stats_by_name.setdefault(name, {"calls": 0, "ms": 0.0, "shape": shape})
+        stats["calls"] = int(stats["calls"]) + 1
+        stats["ms"] = float(stats["ms"]) + elapsed_ms
+        stats["shape"] = shape
+    pending.clear()
+
+    total_ms = sum(float(item["ms"]) for item in stats_by_name.values())
+    top = sorted(stats_by_name.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
+    summary = "; ".join(
+        f"{name}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
+        for name, item in top
+    )
+    LOG.info(
+        "%s after %d %s: total %.2fs; %s",
+        label,
+        call_count,
+        call_unit,
+        total_ms / 1000.0,
+        summary,
+    )
+
+
 def _record_svdint4_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
     global _SVDINT4_PROFILE_CALLS
     _SVDINT4_PROFILE_CALLS += 1
@@ -186,29 +227,52 @@ def _record_svdint4_profile(name: str, start: torch.cuda.Event, end: torch.cuda.
 
 
 def _flush_svdint4_profile() -> None:
-    if not _SVDINT4_PROFILE_PENDING:
+    _flush_cuda_event_profile(
+        _SVDINT4_PROFILE_PENDING,
+        _SVDINT4_PROFILE_STATS,
+        _SVDINT4_PROFILE_CALLS,
+        "SVDInt4 profile",
+        "Linear calls",
+    )
+
+
+def _record_svdint4_base_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
+    global _SVDINT4_BASE_PROFILE_CALLS
+    _SVDINT4_BASE_PROFILE_CALLS += 1
+    _SVDINT4_BASE_PROFILE_PENDING.append((name, start, end, input_shape))
+    if _SVDINT4_BASE_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
         return
 
-    _SVDINT4_PROFILE_PENDING[-1][2].synchronize()
-    for name, start, end, input_shape in _SVDINT4_PROFILE_PENDING:
-        elapsed_ms = start.elapsed_time(end)
-        stats = _SVDINT4_PROFILE_STATS.setdefault(name, {"calls": 0, "ms": 0.0, "shape": input_shape})
-        stats["calls"] = int(stats["calls"]) + 1
-        stats["ms"] = float(stats["ms"]) + elapsed_ms
-        stats["shape"] = input_shape
-    _SVDINT4_PROFILE_PENDING.clear()
+    _flush_svdint4_base_profile()
 
-    total_ms = sum(float(item["ms"]) for item in _SVDINT4_PROFILE_STATS.values())
-    top = sorted(_SVDINT4_PROFILE_STATS.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
-    summary = "; ".join(
-        f"{layer}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
-        for layer, item in top
+
+def _flush_svdint4_base_profile() -> None:
+    _flush_cuda_event_profile(
+        _SVDINT4_BASE_PROFILE_PENDING,
+        _SVDINT4_BASE_PROFILE_STATS,
+        _SVDINT4_BASE_PROFILE_CALLS,
+        "SVDInt4 base Linear profile",
+        "base Linear calls",
     )
-    LOG.info(
-        "SVDInt4 profile after %d Linear calls: total %.2fs; %s",
-        _SVDINT4_PROFILE_CALLS,
-        total_ms / 1000.0,
-        summary,
+
+
+def _record_svdint4_adapter_profile(name: str, start: torch.cuda.Event, end: torch.cuda.Event, input_shape: tuple[int, ...]) -> None:
+    global _SVDINT4_ADAPTER_PROFILE_CALLS
+    _SVDINT4_ADAPTER_PROFILE_CALLS += 1
+    _SVDINT4_ADAPTER_PROFILE_PENDING.append((name, start, end, input_shape))
+    if _SVDINT4_ADAPTER_PROFILE_CALLS % SVDINT4_PROFILE_INTERVAL != 0:
+        return
+
+    _flush_svdint4_adapter_profile()
+
+
+def _flush_svdint4_adapter_profile() -> None:
+    _flush_cuda_event_profile(
+        _SVDINT4_ADAPTER_PROFILE_PENDING,
+        _SVDINT4_ADAPTER_PROFILE_STATS,
+        _SVDINT4_ADAPTER_PROFILE_CALLS,
+        "SVDInt4 adapter LoRA profile",
+        "adapter LoRA overlay calls",
     )
 
 
@@ -247,29 +311,12 @@ def _record_svdint4_attention_profile(name: str, start: torch.cuda.Event, end: t
 
 
 def _flush_svdint4_attention_profile() -> None:
-    if not _SVDINT4_ATTENTION_PROFILE_PENDING:
-        return
-
-    _SVDINT4_ATTENTION_PROFILE_PENDING[-1][2].synchronize()
-    for name, start, end, shape in _SVDINT4_ATTENTION_PROFILE_PENDING:
-        elapsed_ms = start.elapsed_time(end)
-        stats = _SVDINT4_ATTENTION_PROFILE_STATS.setdefault(name, {"calls": 0, "ms": 0.0, "shape": shape})
-        stats["calls"] = int(stats["calls"]) + 1
-        stats["ms"] = float(stats["ms"]) + elapsed_ms
-        stats["shape"] = shape
-    _SVDINT4_ATTENTION_PROFILE_PENDING.clear()
-
-    total_ms = sum(float(item["ms"]) for item in _SVDINT4_ATTENTION_PROFILE_STATS.values())
-    top = sorted(_SVDINT4_ATTENTION_PROFILE_STATS.items(), key=lambda item: float(item[1]["ms"]), reverse=True)[:8]
-    summary = "; ".join(
-        f"{name}: calls={item['calls']} avg={float(item['ms']) / int(item['calls']):.2f}ms total={float(item['ms']):.1f}ms shape={item['shape']}"
-        for name, item in top
-    )
-    LOG.info(
-        "SVDInt4 attention profile after %d attention calls: total %.2fs; %s",
+    _flush_cuda_event_profile(
+        _SVDINT4_ATTENTION_PROFILE_PENDING,
+        _SVDINT4_ATTENTION_PROFILE_STATS,
         _SVDINT4_ATTENTION_PROFILE_CALLS,
-        total_ms / 1000.0,
-        summary,
+        "SVDInt4 attention profile",
+        "attention calls",
     )
 
 
@@ -705,11 +752,17 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
 
         _validate_cuda_kernel_runtime(input)
         if SVDINT4_PROFILE:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            profile_name = getattr(self, "packed_name", "<unknown>")
+            profile_shape = tuple(input.shape)
+            total_start = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            base_start = torch.cuda.Event(enable_timing=True)
+            base_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
         original_dtype = input.dtype
         x = input if input.dtype == self.compute_dtype else input.to(self.compute_dtype)
+        if SVDINT4_PROFILE:
+            base_start.record()
         if len(self.weight_function) == 0 and self.weight is not None and self.weight.device == x.device:
             out = torch.nn.functional.linear(x, self.weight, None)
         else:
@@ -729,12 +782,27 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
                 self.weight_function = saved_weight_function
                 if weight is not None:
                     comfy.ops.uncast_bias_weight(self, weight, None, offload_stream)
+        if SVDINT4_PROFILE:
+            base_end.record()
+
+        adapter_start = None
+        adapter_end = None
+        adapter_count = len(self._svdint4_adapter_lora_overlays)
+        if SVDINT4_PROFILE and adapter_count:
+            adapter_start = torch.cuda.Event(enable_timing=True)
+            adapter_end = torch.cuda.Event(enable_timing=True)
+            adapter_start.record()
         out = self._apply_lora_adapters(x, out)
+        if SVDINT4_PROFILE and adapter_count:
+            adapter_end.record()
         if out.dtype != original_dtype:
             out = out.to(original_dtype)
         if SVDINT4_PROFILE:
-            end.record()
-            _record_svdint4_profile(getattr(self, "packed_name", "<unknown>"), start, end, tuple(input.shape))
+            total_end.record()
+            _record_svdint4_base_profile(profile_name, base_start, base_end, profile_shape)
+            if adapter_start is not None and adapter_end is not None:
+                _record_svdint4_adapter_profile(profile_name, adapter_start, adapter_end, profile_shape)
+            _record_svdint4_profile(profile_name, total_start, total_end, profile_shape)
         return out
 
 
@@ -1012,7 +1080,8 @@ def load_svdint4_model(
     if SVDINT4_PROFILE:
         _install_attention_profiler(model)
         LOG.warning(
-            "SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls and every %d attention calls.",
+            "SVDInt4 profiling is enabled; CUDA event timings will be logged every %d Linear calls "
+            "(base/adapter/total) and every %d attention calls.",
             SVDINT4_PROFILE_INTERVAL,
             SVDINT4_ATTENTION_PROFILE_INTERVAL,
         )
