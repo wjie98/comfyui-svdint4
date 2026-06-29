@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import uuid
 from pathlib import Path
 
@@ -36,7 +37,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
-W4_STORAGE_FIELDS = {"w4_qweight", "w4_scales"}
+W4_STORAGE_FIELDS = {"w4_qweight", "w4_scales", "w4_zeros"}
 W4_STORAGE_REQUIRED_FIELDS = {"w4_qweight", "w4_scales"}
 W4_STORAGE_GROUP_SIZE = 64
 SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
@@ -273,12 +274,38 @@ def _validate_w4_storage_layer_tensors(
         raise TypeError(f"W4 storage layer {name}.w4_scales must be {COMPUTE_DTYPE}, got {scales.dtype}")
     if scales.ndim != 2:
         raise ValueError(f"W4 storage layer {name}.w4_scales must be 2D, got shape {tuple(scales.shape)}")
-    expected_groups = (int(expected_in) + W4_STORAGE_GROUP_SIZE - 1) // W4_STORAGE_GROUP_SIZE
-    if tuple(scales.shape) != (int(expected_out), expected_groups):
+    if int(scales.shape[0]) != int(expected_out):
         raise ValueError(
             f"W4 storage layer {name}.w4_scales shape mismatch: got {tuple(scales.shape)}, "
-            f"expected ({expected_out}, {expected_groups})"
+            f"expected out_features {expected_out}"
         )
+    _infer_w4_storage_group_size(name, int(expected_in), int(scales.shape[1]))
+
+    zeros = tensors.get("w4_zeros")
+    if zeros is not None:
+        if zeros.dtype != COMPUTE_DTYPE:
+            raise TypeError(f"W4 storage layer {name}.w4_zeros must be {COMPUTE_DTYPE}, got {zeros.dtype}")
+        if zeros.ndim != 2:
+            raise ValueError(f"W4 storage layer {name}.w4_zeros must be 2D, got shape {tuple(zeros.shape)}")
+        if tuple(zeros.shape) != tuple(scales.shape):
+            raise ValueError(
+                f"W4 storage layer {name}.w4_zeros shape mismatch: got {tuple(zeros.shape)}, "
+                f"expected {tuple(scales.shape)}"
+            )
+
+
+def _infer_w4_storage_group_size(name: str, in_features: int, group_count: int) -> int:
+    if group_count <= 0:
+        raise ValueError(f"W4 storage layer {name}.w4_scales must have at least one group")
+    if in_features % group_count == 0:
+        return in_features // group_count
+    default_groups = math.ceil(in_features / W4_STORAGE_GROUP_SIZE)
+    if group_count == default_groups:
+        return W4_STORAGE_GROUP_SIZE
+    raise ValueError(
+        f"W4 storage layer {name} has {group_count} groups for {in_features} input features; "
+        "non-divisible custom group sizes are not supported without explicit metadata"
+    )
 
 
 def _owned_cpu_tensor(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -294,7 +321,7 @@ def _packed_tensor_dtype(field: str) -> torch.dtype | None:
 
 
 def _w4_storage_tensor_dtype(field: str) -> torch.dtype | None:
-    if field == "w4_scales":
+    if field in {"w4_scales", "w4_zeros"}:
         return COMPUTE_DTYPE
     return torch.uint8 if field == "w4_qweight" else None
 
@@ -488,20 +515,27 @@ class W4StorageParams:
     scales: torch.Tensor
     orig_dtype: torch.dtype
     orig_shape: tuple[int, int]
+    zeros: torch.Tensor | None = None
     group_size: int = W4_STORAGE_GROUP_SIZE
     name: str = ""
 
     def _tensor_fields(self) -> tuple[str, ...]:
-        return ("scales",)
+        return ("scales", "zeros")
 
     def to_device(self, device: torch.device) -> "W4StorageParams":
-        return dataclasses.replace(self, scales=self.scales.to(device=device))
+        zeros = None if self.zeros is None else self.zeros.to(device=device)
+        return dataclasses.replace(self, scales=self.scales.to(device=device), zeros=zeros)
 
     def clone(self) -> "W4StorageParams":
-        return dataclasses.replace(self, scales=self.scales.clone())
+        zeros = None if self.zeros is None else self.zeros.clone()
+        return dataclasses.replace(self, scales=self.scales.clone(), zeros=zeros)
 
     def copy_from(self, src: "W4StorageParams", non_blocking: bool = False) -> None:
         self.scales.copy_(src.scales, non_blocking=non_blocking)
+        if self.zeros is not None and src.zeros is not None:
+            self.zeros.copy_(src.zeros, non_blocking=non_blocking)
+        else:
+            object.__setattr__(self, "zeros", src.zeros)
         object.__setattr__(self, "orig_dtype", src.orig_dtype)
         object.__setattr__(self, "orig_shape", src.orig_shape)
         object.__setattr__(self, "group_size", src.group_size)
@@ -519,10 +553,15 @@ def _dequantize_w4_storage(qdata: torch.Tensor, params: W4StorageParams) -> torc
     unpacked[:, 0::2] = (packed & 0x0F).to(torch.int16)
     unpacked[:, 1::2] = (packed >> 4).to(torch.int16)
     q = unpacked[:, :in_features].to(dtype=params.orig_dtype)
-    q.sub_(8.0)
     scales = params.scales.to(device=q.device, dtype=params.orig_dtype)
     expanded_scales = scales.repeat_interleave(params.group_size, dim=1)[:, :in_features]
-    q.mul_(expanded_scales)
+    if params.zeros is None:
+        q.sub_(8.0)
+        q.mul_(expanded_scales)
+    else:
+        zeros = params.zeros.to(device=q.device, dtype=params.orig_dtype)
+        expanded_zeros = zeros.repeat_interleave(params.group_size, dim=1)[:, :in_features]
+        q.mul_(expanded_scales).add_(expanded_zeros)
     return q.view(out_features, in_features)
 
 
@@ -540,14 +579,19 @@ class W4StorageLayout(QuantizedLayout):
     @classmethod
     def get_plain_tensors(cls, qtensor) -> tuple[torch.Tensor, ...]:
         params = qtensor._params
-        return (qtensor._qdata, params.scales)
+        if params.zeros is None:
+            return (qtensor._qdata, params.scales)
+        return (qtensor._qdata, params.scales, params.zeros)
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: W4StorageParams) -> dict[str, torch.Tensor]:
-        return {
+        tensors = {
             ".w4_qweight": qdata,
             ".w4_scales": params.scales,
         }
+        if params.zeros is not None:
+            tensors[".w4_zeros"] = params.zeros
+        return tensors
 
 
 if _HAS_COMFY_QUANTIZED_TENSOR:
@@ -737,18 +781,23 @@ class W4StorageTensor:
         _validate_w4_storage_layer_tensors(name, tensors, self.in_features, self.out_features)
         qweight = tensors["w4_qweight"].to(torch.uint8).contiguous()
         scales = tensors["w4_scales"].contiguous()
+        zeros = tensors.get("w4_zeros")
+        if zeros is not None:
+            zeros = zeros.contiguous()
+        group_size = _infer_w4_storage_group_size(name, self.in_features, int(scales.shape[1]))
         if _HAS_COMFY_QUANTIZED_TENSOR:
             params = W4StorageParams(
                 scales=scales,
                 orig_dtype=compute_dtype,
                 orig_shape=(self.out_features, self.in_features),
-                group_size=W4_STORAGE_GROUP_SIZE,
+                zeros=zeros,
+                group_size=group_size,
                 name=name,
             )
             self.tensor = QuantizedTensor(qweight, W4_STORAGE_LAYOUT_NAME, params)
         else:
             self.tensor = None
-        self.packed_nbytes = _tensor_nbytes(qweight) + _tensor_nbytes(scales)
+        self.packed_nbytes = _tensor_nbytes(qweight) + _tensor_nbytes(scales) + _tensor_nbytes(zeros)
 
     @property
     def nbytes(self) -> int:
@@ -898,6 +947,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             params = self.weight._params
             destination[prefix + "w4_qweight"] = self.weight._qdata if keep_vars else self.weight._qdata.detach()
             destination[prefix + "w4_scales"] = params.scales if keep_vars else params.scales.detach()
+            if params.zeros is not None:
+                destination[prefix + "w4_zeros"] = params.zeros if keep_vars else params.zeros.detach()
             if self.bias is not None:
                 destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
             return
