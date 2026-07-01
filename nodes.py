@@ -94,6 +94,13 @@ def _validate_context_window_frames(context_length: int, context_overlap: int) -
     return ((context_length - 1) // 4) + 1, context_overlap // 4
 
 
+def _validate_anchor_length_frames(anchor_length: int) -> int:
+    anchor_length = int(anchor_length)
+    if anchor_length < 0 or anchor_length % 4 != 0:
+        raise ValueError(f"anchor_length must be 0 or a positive 4*n real-frame count; got {anchor_length}.")
+    return anchor_length // 4
+
+
 class SVDInt4DiffusionModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -533,7 +540,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
         *,
         center_latents: int,
         halo_latents: int,
-        anchor_count: int,
+        anchor_latents: int,
         first_frame_sink: bool,
         first_frame_anchor_included: bool,
         **kwargs,
@@ -542,8 +549,8 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             raise ValueError("anchor_sparse mode requires context_length/center_latents > 0.")
         if halo_latents < 0:
             raise ValueError("anchor_sparse mode requires context_overlap/halo_latents >= 0.")
-        if anchor_count < 0:
-            raise ValueError("anchor_sparse mode requires anchor_count >= 0.")
+        if anchor_latents < 0:
+            raise ValueError("anchor_sparse mode requires anchor_latents >= 0.")
         super().__init__(
             context_length=center_latents,
             context_overlap=halo_latents,
@@ -552,7 +559,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
         )
         self.center_latents = int(center_latents)
         self.halo_latents = int(halo_latents)
-        self.anchor_count = int(anchor_count)
+        self.anchor_latents = int(anchor_latents)
         self.first_frame_anchor_included = bool(first_frame_anchor_included)
         self._anchor_indices: tuple[int, ...] = ()
 
@@ -561,7 +568,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             conds,
             x_in,
             self.dim,
-            self.anchor_count,
+            self.anchor_latents,
             include_first_frame=self.first_frame_anchor_included,
         )
         try:
@@ -577,7 +584,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             local_end = min(full_length, center_end + self.halo_latents)
             local = tuple(range(local_start, local_end))
             local_set = set(local)
-            budget = self.anchor_count
+            budget = self.anchor_latents
             candidates = tuple(index for index in self._anchor_indices if index not in local_set)
             chosen = _choose_anchor_subset(candidates, center_start, center_end, budget, full_length)
             windows.append(
@@ -605,7 +612,7 @@ def _select_anchor_indices_from_conds(
     conds,
     x_in: torch.Tensor,
     dim: int,
-    anchor_count: int,
+    anchor_latents: int,
     *,
     include_first_frame: bool,
 ) -> tuple[int, ...]:
@@ -627,7 +634,7 @@ def _select_anchor_indices_from_conds(
             "anchor_sparse mode requires BerniniConditioning context_latents matching the target latent length. "
             "Connect Bernini Conditioning to the sampler so the model conds include context_latents."
         )
-    return _select_frame_anchors(source, reference, anchor_count, include_first_frame=include_first_frame)
+    return _select_frame_anchors(source, reference, anchor_latents, include_first_frame=include_first_frame)
 
 
 def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
@@ -646,15 +653,15 @@ def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
 def _select_frame_anchors(
     source_latents: torch.Tensor,
     reference_latents: torch.Tensor | None,
-    anchor_count: int,
+    anchor_latents: int,
     *,
     include_first_frame: bool,
 ) -> tuple[int, ...]:
     source = _as_tchw(source_latents)
     frame_count = int(source.shape[0])
-    if frame_count == 0 or anchor_count <= 0:
+    if frame_count == 0 or anchor_latents <= 0:
         return ()
-    target_count = min(int(anchor_count), frame_count)
+    target_count = min(int(anchor_latents), frame_count)
     if target_count <= 0:
         return ()
     reference = _as_tchw(reference_latents) if reference_latents is not None else None
@@ -819,13 +826,17 @@ class BerniniContextWindowsCore:
                 "freenoise": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "anchor_count": (
+                "anchor_length": (
                     "INT",
                     {
-                        "default": 6,
+                        "default": 16,
                         "min": 0,
-                        "max": 128,
-                        "tooltip": "anchor_sparse only: maximum adaptive global anchor latent frames added to each window, excluding first_frame_sink.",
+                        "max": 4096,
+                        "step": 4,
+                        "tooltip": (
+                            "anchor_sparse only: adaptive global anchor budget in real video frames. "
+                            "Must be 0 or 4*n; 16 frames maps to 4 anchor latents. Excludes first_frame_sink."
+                        ),
                     },
                 ),
                 "context_stride": (
@@ -864,7 +875,7 @@ class BerniniContextWindowsCore:
         context_schedule: str,
         fuse_method: str,
         freenoise: bool,
-        anchor_count: int = 6,
+        anchor_length: int = 16,
         context_stride: int = 1,
         first_frame_sink: bool = True,
     ):
@@ -872,13 +883,14 @@ class BerniniContextWindowsCore:
             context_length,
             context_overlap,
         )
+        anchor_latents = _validate_anchor_length_frames(anchor_length)
         if context_schedule == _ANCHOR_SCHEDULE:
             context_handler = BerniniAnchorContextHandler(
                 context_schedule=comfy.context_windows.get_matching_context_schedule(comfy.context_windows.ContextSchedules.STATIC_STANDARD),
                 fuse_method=comfy.context_windows.get_matching_fuse_method(comfy.context_windows.ContextFuseMethods.FLAT),
                 center_latents=latent_context_length,
                 halo_latents=latent_context_overlap,
-                anchor_count=max(int(anchor_count), 0),
+                anchor_latents=anchor_latents,
                 first_frame_sink=first_frame_sink,
                 first_frame_anchor_included=not first_frame_sink,
                 context_stride=1,
@@ -937,13 +949,15 @@ class BerniniContextWindowsCore:
 
         LOG.info(
             "Bernini context windows enabled: schedule=%s, length=%s -> %s latent frames, "
-            "overlap/halo=%s -> %s latent frames, anchors=%s, first_frame_sink=%s, fuse=%s",
+            "overlap/halo=%s -> %s latent frames, anchor_length=%s -> %s anchor latents, "
+            "first_frame_sink=%s, fuse=%s",
             context_schedule,
             context_length,
             latent_context_length,
             context_overlap,
             latent_context_overlap,
-            anchor_count if context_schedule == _ANCHOR_SCHEDULE else 0,
+            anchor_length if context_schedule == _ANCHOR_SCHEDULE else 0,
+            anchor_latents if context_schedule == _ANCHOR_SCHEDULE else 0,
             first_frame_sink,
             effective_fuse_method,
         )
