@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import inspect
 import math
 from pathlib import Path
 
@@ -173,16 +172,12 @@ class BerniniPadVideoLength:
         return (torch.cat((image, tail), dim=0), width, height, frame_count, output_length)
 
 
-def _window_start_and_stride(window, use_causal_anchor: bool) -> tuple[float, float]:
+def _window_start_and_stride(window) -> tuple[float, float]:
     indices = list(getattr(window, "index_list", []) or [])
     if not indices:
         return 0.0, 1.0
 
     start = indices[0]
-    anchor_idx = getattr(window, "causal_anchor_index", None)
-    if use_causal_anchor and anchor_idx is not None and anchor_idx >= 0:
-        start = anchor_idx
-
     stride = 1
     if len(indices) > 1:
         deltas = [b - a for a, b in zip(indices, indices[1:])]
@@ -380,22 +375,12 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
 
     if getattr(window, "svdint4_use_absolute_indices", False):
         indices = list(window.index_list)
-        anchor_idx = getattr(window, "causal_anchor_index", None)
-        if (
-            bool(transformer_options.get("svdint4_bernini_context_use_causal_anchor", False))
-            and anchor_idx is not None
-            and anchor_idx >= 0
-        ):
-            indices = [anchor_idx] + indices
         new_transformer_options = dict(transformer_options)
         new_transformer_options[_ABSOLUTE_INDEX_KEY] = tuple(int(index) for index in indices)
         args, kwargs = _with_transformer_options(args, kwargs, new_transformer_options)
         return executor(*args, **kwargs)
 
-    start, stride = _window_start_and_stride(
-        window,
-        bool(transformer_options.get("svdint4_bernini_context_use_causal_anchor", False)),
-    )
+    start, stride = _window_start_and_stride(window)
     if start == 0.0 and stride == 1.0:
         return executor(*args, **kwargs)
 
@@ -410,18 +395,126 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
-def _make_context_handler(**kwargs):
-    params = inspect.signature(comfy.context_windows.IndexListContextHandler).parameters
-    if kwargs.get("causal_window_fix", False) and "causal_window_fix" not in params:
-        LOG.warning("Current ComfyUI does not support context window causal_window_fix; ignoring it.")
-    if kwargs.get("split_conds_to_windows", False) and "split_conds_to_windows" not in params:
-        LOG.warning("Current ComfyUI does not support split_conds_to_windows; ignoring it.")
-    supported_kwargs = {k: v for k, v in kwargs.items() if k in params}
-    return comfy.context_windows.IndexListContextHandler(**supported_kwargs)
+class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
+    def __init__(self, *, first_frame_sink: bool, **kwargs):
+        kwargs["causal_window_fix"] = False
+        super().__init__(**kwargs)
+        self.first_frame_sink = bool(first_frame_sink)
+
+    def _build_context_window(
+        self,
+        *,
+        target_indices: tuple[int, ...],
+        context_indices: tuple[int, ...],
+        full_length: int,
+        context_overlap: int,
+    ):
+        target_indices = tuple(int(index) for index in target_indices)
+        if not target_indices:
+            raise ValueError("Bernini context windows require at least one write-back latent index.")
+
+        model_indices = set(int(index) for index in context_indices)
+        model_indices.update(target_indices)
+        if self.first_frame_sink and full_length > 0 and 0 not in target_indices:
+            model_indices.add(0)
+        model_indices = tuple(sorted(model_indices))
+
+        window = comfy.context_windows.IndexListContextWindow(
+            list(model_indices),
+            dim=self.dim,
+            total_frames=full_length,
+            context_overlap=context_overlap,
+        )
+        window.svdint4_use_absolute_indices = True
+        window.svdint4_write_latent_indices = target_indices
+        window.svdint4_write_model_positions = tuple(model_indices.index(index) for index in target_indices)
+        window.svdint4_write_context_overlap = int(context_overlap)
+        return window
+
+    def combine_context_window_results(
+        self,
+        x_in: torch.Tensor,
+        sub_conds_out,
+        sub_conds,
+        window,
+        window_idx: int,
+        total_windows: int,
+        timestep: torch.Tensor,
+        conds_final: list[torch.Tensor],
+        counts_final: list[torch.Tensor],
+        biases_final: list[torch.Tensor],
+    ):
+        write_indices = getattr(window, "svdint4_write_latent_indices", None)
+        write_positions = getattr(window, "svdint4_write_model_positions", None)
+        if write_indices is None or write_positions is None:
+            return super().combine_context_window_results(
+                x_in,
+                sub_conds_out,
+                sub_conds,
+                window,
+                window_idx,
+                total_windows,
+                timestep,
+                conds_final,
+                counts_final,
+                biases_final,
+            )
+
+        if self.fuse_method.name == comfy.context_windows.ContextFuseMethods.RELATIVE:
+            first = write_indices[0]
+            last = write_indices[-1]
+            center = (first + last) / 2
+            width = (last - first + 1e-2) / 2
+            for pos, index in zip(write_positions, write_indices):
+                bias = 1 - abs(index - center) / width
+                bias = max(1e-2, bias)
+                for i in range(len(sub_conds_out)):
+                    bias_total = biases_final[i][index]
+                    prev_weight = bias_total / (bias_total + bias)
+                    new_weight = bias / (bias_total + bias)
+                    dst = tuple([slice(None)] * self.dim + [index])
+                    src = tuple([slice(None)] * self.dim + [pos])
+                    conds_final[i][dst] = conds_final[i][dst] * prev_weight + sub_conds_out[i][src] * new_weight
+                    biases_final[i][index] = bias_total + bias
+            return
+
+        weights = comfy.context_windows.get_context_weights(
+            len(write_indices),
+            x_in.shape[self.dim],
+            list(write_indices),
+            self,
+            sigma=timestep,
+            context_overlap=getattr(window, "svdint4_write_context_overlap", self.context_overlap),
+        )
+        weights_tensor = comfy.context_windows.match_weights_to_dim(weights, x_in, self.dim, device=x_in.device)
+        for output, final, count in zip(sub_conds_out, conds_final, counts_final):
+            for weight_pos, (pos, index) in enumerate(zip(write_positions, write_indices)):
+                dst = tuple([slice(None)] * self.dim + [index])
+                src = tuple([slice(None)] * self.dim + [pos])
+                weight_src = tuple([slice(None)] * self.dim + [weight_pos])
+                final[dst] += output[src] * weights_tensor[weight_src]
+                count[dst] += weights_tensor[weight_src]
 
 
-class BerniniAnchorContextHandler(comfy.context_windows.IndexListContextHandler):
-    def __init__(self, *, center_latents: int, halo_latents: int, anchor_count: int, **kwargs):
+class BerniniScheduledContextHandler(BerniniContextHandlerBase):
+    def get_context_windows(self, model, x_in: torch.Tensor, model_options: dict[str]):
+        full_length = x_in.size(self.dim)
+        windows = []
+        for window in super().get_context_windows(model, x_in, model_options):
+            indices = tuple(int(index) for index in window.index_list)
+            windows.append(
+                self._build_context_window(
+                    target_indices=indices,
+                    context_indices=indices,
+                    full_length=full_length,
+                    context_overlap=window.context_overlap,
+                )
+            )
+        return windows
+
+
+class BerniniAnchorContextHandler(BerniniContextHandlerBase):
+    def __init__(self, *, center_latents: int, halo_latents: int, anchor_count: int, first_frame_sink: bool, **kwargs):
         if center_latents <= 0:
             raise ValueError("anchor_sparse mode requires context_length/center_latents > 0.")
         if halo_latents < 0:
@@ -431,6 +524,7 @@ class BerniniAnchorContextHandler(comfy.context_windows.IndexListContextHandler)
         super().__init__(
             context_length=center_latents,
             context_overlap=halo_latents,
+            first_frame_sink=first_frame_sink,
             **kwargs,
         )
         self.center_latents = int(center_latents)
@@ -439,7 +533,12 @@ class BerniniAnchorContextHandler(comfy.context_windows.IndexListContextHandler)
         self._anchor_indices: tuple[int, ...] = ()
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
-        self._anchor_indices = _select_anchor_indices_from_conds(conds, x_in, self.dim, self.anchor_count)
+        self._anchor_indices = _select_anchor_indices_from_conds(
+            conds,
+            x_in,
+            self.dim,
+            self.anchor_count,
+        )
         try:
             return super().execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
         finally:
@@ -456,54 +555,15 @@ class BerniniAnchorContextHandler(comfy.context_windows.IndexListContextHandler)
             budget = self.anchor_count
             candidates = tuple(index for index in self._anchor_indices if index not in local_set)
             chosen = _choose_anchor_subset(candidates, center_start, center_end, budget, full_length)
-            model_indices = tuple(sorted(local + chosen))
-            window = comfy.context_windows.IndexListContextWindow(
-                list(model_indices),
-                dim=self.dim,
-                total_frames=full_length,
-                context_overlap=self.context_overlap,
+            windows.append(
+                self._build_context_window(
+                    target_indices=tuple(range(center_start, center_end)),
+                    context_indices=tuple(sorted(local + chosen)),
+                    full_length=full_length,
+                    context_overlap=self.context_overlap,
+                )
             )
-            window.svdint4_use_absolute_indices = True
-            window.svdint4_center_latent_indices = tuple(range(center_start, center_end))
-            window.svdint4_center_model_positions = tuple(model_indices.index(index) for index in window.svdint4_center_latent_indices)
-            windows.append(window)
         return windows
-
-    def combine_context_window_results(
-        self,
-        x_in: torch.Tensor,
-        sub_conds_out,
-        sub_conds,
-        window,
-        window_idx: int,
-        total_windows: int,
-        timestep: torch.Tensor,
-        conds_final: list[torch.Tensor],
-        counts_final: list[torch.Tensor],
-        biases_final: list[torch.Tensor],
-    ):
-        center_indices = getattr(window, "svdint4_center_latent_indices", None)
-        center_positions = getattr(window, "svdint4_center_model_positions", None)
-        if center_indices is None or center_positions is None:
-            return super().combine_context_window_results(
-                x_in,
-                sub_conds_out,
-                sub_conds,
-                window,
-                window_idx,
-                total_windows,
-                timestep,
-                conds_final,
-                counts_final,
-                biases_final,
-            )
-
-        for output, final, count in zip(sub_conds_out, conds_final, counts_final):
-            for pos, index in zip(center_positions, center_indices):
-                dst = tuple([slice(None)] * self.dim + [index])
-                src = tuple([slice(None)] * self.dim + [pos])
-                final[dst] += output[src]
-                count[dst] += 1.0
 
 
 def _center_ranges(frame_count: int, center_size: int) -> list[tuple[int, int]]:
@@ -516,7 +576,12 @@ def _center_ranges(frame_count: int, center_size: int) -> list[tuple[int, int]]:
     return ranges or [(0, frame_count)]
 
 
-def _select_anchor_indices_from_conds(conds, x_in: torch.Tensor, dim: int, anchor_count: int) -> tuple[int, ...]:
+def _select_anchor_indices_from_conds(
+    conds,
+    x_in: torch.Tensor,
+    dim: int,
+    anchor_count: int,
+) -> tuple[int, ...]:
     context_latents = _extract_context_latents_from_conds(conds)
     source = None
     reference = None
@@ -551,7 +616,11 @@ def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
     return []
 
 
-def _select_frame_anchors(source_latents: torch.Tensor, reference_latents: torch.Tensor | None, anchor_count: int) -> tuple[int, ...]:
+def _select_frame_anchors(
+    source_latents: torch.Tensor,
+    reference_latents: torch.Tensor | None,
+    anchor_count: int,
+) -> tuple[int, ...]:
     source = _as_tchw(source_latents)
     frame_count = int(source.shape[0])
     if frame_count == 0 or anchor_count <= 0:
@@ -561,7 +630,10 @@ def _select_frame_anchors(source_latents: torch.Tensor, reference_latents: torch
         return ()
     reference = _as_tchw(reference_latents) if reference_latents is not None else None
     scores = _score_anchor_frames(source, reference)
-    return tuple(_select_with_gap(scores, target_count, min_gap=8, force_edges=True))
+    initial = (0,)
+    if frame_count > 1 and target_count > 1:
+        initial = (0, frame_count - 1)
+    return tuple(_select_with_gap(scores, target_count, min_gap=8, initial_indices=initial))
 
 
 def _as_tchw(latents: torch.Tensor) -> torch.Tensor:
@@ -616,13 +688,19 @@ def _robust_z(values: torch.Tensor) -> torch.Tensor:
     return (values - median) / (mad + 1e-6)
 
 
-def _select_with_gap(scores: torch.Tensor, target_count: int, min_gap: int, force_edges: bool) -> list[int]:
+def _select_with_gap(
+    scores: torch.Tensor,
+    target_count: int,
+    min_gap: int,
+    initial_indices: tuple[int, ...] = (),
+) -> list[int]:
     frame_count = int(scores.numel())
     selected: list[int] = []
-    if force_edges and frame_count > 0:
-        selected.append(0)
-        if frame_count > 1 and len(selected) < target_count:
-            selected.append(frame_count - 1)
+    for index in initial_indices:
+        if 0 <= index < frame_count and index not in selected:
+            selected.append(int(index))
+        if len(selected) >= target_count:
+            break
     for index in torch.argsort(scores, descending=True).tolist():
         if len(selected) >= target_count:
             break
@@ -740,11 +818,14 @@ class BerniniContextWindowsCore:
                     },
                 ),
                 "condition": ("CONDITIONING",),
-                "causal_window_fix": (
+                "first_frame_sink": (
                     "BOOLEAN",
                     {
-                        "default": False,
-                        "tooltip": "Advanced: prepend the previous latent frame to non-zero windows. Disabled by default for Bernini reference alignment.",
+                        "default": True,
+                        "tooltip": (
+                            "Use latent frame 0 as a context-only sink for windows that do not already include it. "
+                            "The first window still writes frame 0 normally."
+                        ),
                     },
                 ),
             },
@@ -768,7 +849,7 @@ class BerniniContextWindowsCore:
         anchor_count: int = 6,
         context_stride: int = 1,
         condition=None,
-        causal_window_fix: bool = False,
+        first_frame_sink: bool = True,
     ):
         if sampling_mode == _ANCHOR_MODE:
             _validate_anchor_condition(condition)
@@ -780,13 +861,13 @@ class BerniniContextWindowsCore:
                 center_latents=latent_context_length,
                 halo_latents=latent_context_overlap,
                 anchor_count=max(int(anchor_count), 0),
+                first_frame_sink=first_frame_sink,
                 context_stride=1,
                 closed_loop=False,
                 dim=2,
                 freenoise=freenoise,
                 cond_retain_index_list=[],
                 latent_retain_index_list=[],
-                causal_window_fix=causal_window_fix,
             )
         else:
             latent_context_length = max(((context_length - 1) // 4) + 1, 1)
@@ -795,7 +876,7 @@ class BerniniContextWindowsCore:
                 latent_context_overlap = 0
             else:
                 latent_context_overlap = min(latent_context_overlap, latent_context_length - 1)
-            context_handler = _make_context_handler(
+            context_handler = BerniniScheduledContextHandler(
                 context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
                 fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
                 context_length=latent_context_length,
@@ -806,14 +887,12 @@ class BerniniContextWindowsCore:
                 freenoise=freenoise,
                 cond_retain_index_list=[],
                 latent_retain_index_list=[],
-                causal_window_fix=causal_window_fix,
+                first_frame_sink=first_frame_sink,
             )
 
         patched = model.clone()
         patched.model_options["context_handler"] = context_handler
-        patched.model_options.setdefault("transformer_options", {})[
-            "svdint4_bernini_context_use_causal_anchor"
-        ] = bool(causal_window_fix)
+        patched.model_options.setdefault("transformer_options", {})
 
         patched.remove_wrappers_with_key(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
@@ -840,13 +919,14 @@ class BerniniContextWindowsCore:
 
         LOG.info(
             "Bernini context windows enabled: mode=%s, length=%s -> %s latent frames, "
-            "overlap/halo=%s -> %s latent frames, anchors=%s, schedule=%s, fuse=%s",
+            "overlap/halo=%s -> %s latent frames, anchors=%s, first_frame_sink=%s, schedule=%s, fuse=%s",
             sampling_mode,
             context_length,
             latent_context_length,
             context_overlap,
             latent_context_overlap,
             anchor_count if sampling_mode == _ANCHOR_MODE else 0,
+            first_frame_sink,
             context_schedule,
             fuse_method,
         )
