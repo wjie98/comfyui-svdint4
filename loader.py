@@ -702,10 +702,19 @@ def _handle_svdint4_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, SVDInt4PackedLayout)
 def _handle_svdint4_addmm(qt, args, kwargs):
     bias, a, b = args[0], args[1], args[2]
+    beta = kwargs.get("beta", 1)
+    alpha = kwargs.get("alpha", 1)
     if not isinstance(b, QuantizedTensor):
-        return torch.addmm(bias, a, b)
+        return torch.addmm(bias, a, b, beta=beta, alpha=alpha)
     _resolve_svdint4_rhs(b)
-    return _svdint4_forward(a, b, bias=bias)
+    out = _svdint4_forward(a, b, bias=None)
+    if alpha != 1:
+        out = out * alpha
+    if beta == 0:
+        return out
+    if beta != 1:
+        bias = bias * beta
+    return out + bias
 
 
 class SVDInt4PackedTensor:

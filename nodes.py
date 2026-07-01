@@ -19,8 +19,7 @@ MODEL_EXTENSIONS = {".safetensors", ".sft"}
 ENV_PATHS = ("SVDINT4_DIT_PATHS",)
 SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 _BERNINI_ROPE_WRAPPER_KEY = "svdint4_bernini_context_rope"
-_ANCHOR_MODE = "anchor_sparse"
-_STANDARD_MODE = "standard"
+_ANCHOR_SCHEDULE = "anchor_sparse"
 _ABSOLUTE_INDEX_KEY = "svdint4_bernini_absolute_latent_indices"
 
 
@@ -78,6 +77,21 @@ def _ceil_wan_frame_count(frame_count: int) -> int:
     if frame_count < 1:
         raise ValueError("Video must contain at least one frame.")
     return ((frame_count - 1 + 3) // 4) * 4 + 1
+
+
+def _validate_context_window_frames(context_length: int, context_overlap: int) -> tuple[int, int]:
+    context_length = int(context_length)
+    context_overlap = int(context_overlap)
+    if context_length < 5 or not _is_wan_frame_count(context_length):
+        raise ValueError(f"context_length must be 4*n+1 real frames with n>=1; got {context_length}.")
+    if context_overlap <= 0 or context_overlap % 4 != 0:
+        raise ValueError(f"context_overlap must be a positive 4*n real-frame count; got {context_overlap}.")
+    if context_overlap >= context_length:
+        raise ValueError(
+            f"context_overlap must be shorter than context_length; got overlap={context_overlap}, "
+            f"length={context_length}."
+        )
+    return ((context_length - 1) // 4) + 1, context_overlap // 4
 
 
 class SVDInt4DiffusionModelLoader:
@@ -514,7 +528,16 @@ class BerniniScheduledContextHandler(BerniniContextHandlerBase):
 
 
 class BerniniAnchorContextHandler(BerniniContextHandlerBase):
-    def __init__(self, *, center_latents: int, halo_latents: int, anchor_count: int, first_frame_sink: bool, **kwargs):
+    def __init__(
+        self,
+        *,
+        center_latents: int,
+        halo_latents: int,
+        anchor_count: int,
+        first_frame_sink: bool,
+        first_frame_anchor_included: bool,
+        **kwargs,
+    ):
         if center_latents <= 0:
             raise ValueError("anchor_sparse mode requires context_length/center_latents > 0.")
         if halo_latents < 0:
@@ -530,6 +553,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
         self.center_latents = int(center_latents)
         self.halo_latents = int(halo_latents)
         self.anchor_count = int(anchor_count)
+        self.first_frame_anchor_included = bool(first_frame_anchor_included)
         self._anchor_indices: tuple[int, ...] = ()
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
@@ -538,6 +562,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             x_in,
             self.dim,
             self.anchor_count,
+            include_first_frame=self.first_frame_anchor_included,
         )
         try:
             return super().execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
@@ -581,6 +606,8 @@ def _select_anchor_indices_from_conds(
     x_in: torch.Tensor,
     dim: int,
     anchor_count: int,
+    *,
+    include_first_frame: bool,
 ) -> tuple[int, ...]:
     context_latents = _extract_context_latents_from_conds(conds)
     source = None
@@ -598,9 +625,9 @@ def _select_anchor_indices_from_conds(
     if source is None:
         raise ValueError(
             "anchor_sparse mode requires BerniniConditioning context_latents matching the target latent length. "
-            "Connect Bernini Conditioning to this node's optional condition input and to the sampler."
+            "Connect Bernini Conditioning to the sampler so the model conds include context_latents."
         )
-    return _select_frame_anchors(source, reference, anchor_count)
+    return _select_frame_anchors(source, reference, anchor_count, include_first_frame=include_first_frame)
 
 
 def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
@@ -620,6 +647,8 @@ def _select_frame_anchors(
     source_latents: torch.Tensor,
     reference_latents: torch.Tensor | None,
     anchor_count: int,
+    *,
+    include_first_frame: bool,
 ) -> tuple[int, ...]:
     source = _as_tchw(source_latents)
     frame_count = int(source.shape[0])
@@ -630,10 +659,11 @@ def _select_frame_anchors(
         return ()
     reference = _as_tchw(reference_latents) if reference_latents is not None else None
     scores = _score_anchor_frames(source, reference)
-    initial = (0,)
+    initial = (0,) if include_first_frame else ()
+    excluded = () if include_first_frame else (0,)
     if frame_count > 1 and target_count > 1:
-        initial = (0, frame_count - 1)
-    return tuple(_select_with_gap(scores, target_count, min_gap=8, initial_indices=initial))
+        initial = initial + (frame_count - 1,)
+    return tuple(_select_with_gap(scores, target_count, min_gap=8, initial_indices=initial, excluded_indices=excluded))
 
 
 def _as_tchw(latents: torch.Tensor) -> torch.Tensor:
@@ -693,25 +723,27 @@ def _select_with_gap(
     target_count: int,
     min_gap: int,
     initial_indices: tuple[int, ...] = (),
+    excluded_indices: tuple[int, ...] = (),
 ) -> list[int]:
     frame_count = int(scores.numel())
+    excluded = set(int(index) for index in excluded_indices)
     selected: list[int] = []
     for index in initial_indices:
-        if 0 <= index < frame_count and index not in selected:
+        if 0 <= index < frame_count and index not in excluded and index not in selected:
             selected.append(int(index))
         if len(selected) >= target_count:
             break
     for index in torch.argsort(scores, descending=True).tolist():
         if len(selected) >= target_count:
             break
-        if index in selected:
+        if index in excluded or index in selected:
             continue
         if all(abs(index - other) >= min_gap for other in selected):
             selected.append(int(index))
     for index in torch.argsort(scores, descending=True).tolist():
         if len(selected) >= target_count:
             break
-        if index not in selected:
+        if index not in excluded and index not in selected:
             selected.append(int(index))
     return sorted(selected)
 
@@ -733,18 +765,6 @@ def _choose_anchor_subset(
     return tuple(sorted(item[2] for item in sorted(ranked)[:budget]))
 
 
-def _validate_anchor_condition(condition) -> None:
-    if condition is None:
-        raise ValueError("anchor_sparse mode requires the optional condition input from Bernini Conditioning.")
-    for entry in condition:
-        if not isinstance(entry, (list, tuple)) or len(entry) < 2 or not isinstance(entry[1], dict):
-            continue
-        context = entry[1].get("context_latents")
-        if isinstance(context, list) and context:
-            return
-    raise ValueError("anchor_sparse mode requires condition input containing Bernini context_latents.")
-
-
 class BerniniContextWindowsCore:
     @classmethod
     def INPUT_TYPES(cls):
@@ -754,43 +774,43 @@ class BerniniContextWindowsCore:
                 "context_length": (
                     "INT",
                     {
-                        "default": 17,
-                        "min": 1,
+                        "default": 81,
+                        "min": 5,
                         "max": 16385,
-                        "step": 1,
+                        "step": 4,
                         "tooltip": (
-                            "standard mode: context window length in real video frames. "
-                            "anchor_sparse mode: center latent frames to write back."
+                            "Context window length in real video frames. Must be 4*n+1; "
+                            "81 frames maps to 21 Wan latent frames."
                         ),
                     },
                 ),
                 "context_overlap": (
                     "INT",
                     {
-                        "default": 2,
-                        "min": 0,
+                        "default": 16,
+                        "min": 4,
                         "max": 16384,
-                        "step": 1,
+                        "step": 4,
                         "tooltip": (
-                            "standard mode: overlap in real video frames. "
-                            "anchor_sparse mode: local halo latent frames on each side."
+                            "Context overlap or local halo in real video frames. Must be positive 4*n; "
+                            "16 frames maps to 4 Wan latent frames."
                         ),
-                    },
-                ),
-                "sampling_mode": (
-                    [_STANDARD_MODE, _ANCHOR_MODE],
-                    {
-                        "default": _ANCHOR_MODE,
-                        "tooltip": "standard uses ComfyUI context schedules; anchor_sparse uses adaptive global anchors with absolute RoPE and center-only scatter.",
                     },
                 ),
                 "context_schedule": (
                     [
+                        _ANCHOR_SCHEDULE,
                         comfy.context_windows.ContextSchedules.UNIFORM_STANDARD,
                         comfy.context_windows.ContextSchedules.STATIC_STANDARD,
                         comfy.context_windows.ContextSchedules.BATCHED,
                     ],
-                    {"default": comfy.context_windows.ContextSchedules.UNIFORM_STANDARD},
+                    {
+                        "default": _ANCHOR_SCHEDULE,
+                        "tooltip": (
+                            "anchor_sparse uses adaptive global anchor latents with center-only scatter; "
+                            "other schedules use ComfyUI's standard context windows."
+                        ),
+                    },
                 ),
                 "fuse_method": (
                     comfy.context_windows.ContextFuseMethods.LIST_STATIC,
@@ -805,7 +825,7 @@ class BerniniContextWindowsCore:
                         "default": 6,
                         "min": 0,
                         "max": 128,
-                        "tooltip": "anchor_sparse only: maximum global anchor latent frames added to each window.",
+                        "tooltip": "anchor_sparse only: maximum adaptive global anchor latent frames added to each window, excluding first_frame_sink.",
                     },
                 ),
                 "context_stride": (
@@ -814,10 +834,9 @@ class BerniniContextWindowsCore:
                         "default": 1,
                         "min": 1,
                         "max": 32,
-                        "tooltip": "Advanced: context stride for uniform schedules. RoPE time scale is adjusted for uniform strided windows.",
+                        "tooltip": "Standard schedules only: context stride for uniform schedules. RoPE time scale is adjusted for uniform strided windows.",
                     },
                 ),
-                "condition": ("CONDITIONING",),
                 "first_frame_sink": (
                     "BOOLEAN",
                     {
@@ -842,19 +861,18 @@ class BerniniContextWindowsCore:
         model,
         context_length: int,
         context_overlap: int,
-        sampling_mode: str,
         context_schedule: str,
         fuse_method: str,
         freenoise: bool,
         anchor_count: int = 6,
         context_stride: int = 1,
-        condition=None,
         first_frame_sink: bool = True,
     ):
-        if sampling_mode == _ANCHOR_MODE:
-            _validate_anchor_condition(condition)
-            latent_context_length = max(int(context_length), 1)
-            latent_context_overlap = max(int(context_overlap), 0)
+        latent_context_length, latent_context_overlap = _validate_context_window_frames(
+            context_length,
+            context_overlap,
+        )
+        if context_schedule == _ANCHOR_SCHEDULE:
             context_handler = BerniniAnchorContextHandler(
                 context_schedule=comfy.context_windows.get_matching_context_schedule(comfy.context_windows.ContextSchedules.STATIC_STANDARD),
                 fuse_method=comfy.context_windows.get_matching_fuse_method(comfy.context_windows.ContextFuseMethods.FLAT),
@@ -862,6 +880,7 @@ class BerniniContextWindowsCore:
                 halo_latents=latent_context_overlap,
                 anchor_count=max(int(anchor_count), 0),
                 first_frame_sink=first_frame_sink,
+                first_frame_anchor_included=not first_frame_sink,
                 context_stride=1,
                 closed_loop=False,
                 dim=2,
@@ -870,12 +889,6 @@ class BerniniContextWindowsCore:
                 latent_retain_index_list=[],
             )
         else:
-            latent_context_length = max(((context_length - 1) // 4) + 1, 1)
-            latent_context_overlap = max(context_overlap // 4, 0)
-            if latent_context_length <= 1:
-                latent_context_overlap = 0
-            else:
-                latent_context_overlap = min(latent_context_overlap, latent_context_length - 1)
             context_handler = BerniniScheduledContextHandler(
                 context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
                 fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
@@ -893,6 +906,11 @@ class BerniniContextWindowsCore:
         patched = model.clone()
         patched.model_options["context_handler"] = context_handler
         patched.model_options.setdefault("transformer_options", {})
+        effective_fuse_method = (
+            comfy.context_windows.ContextFuseMethods.FLAT
+            if context_schedule == _ANCHOR_SCHEDULE
+            else fuse_method
+        )
 
         patched.remove_wrappers_with_key(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
@@ -918,17 +936,16 @@ class BerniniContextWindowsCore:
         )
 
         LOG.info(
-            "Bernini context windows enabled: mode=%s, length=%s -> %s latent frames, "
-            "overlap/halo=%s -> %s latent frames, anchors=%s, first_frame_sink=%s, schedule=%s, fuse=%s",
-            sampling_mode,
+            "Bernini context windows enabled: schedule=%s, length=%s -> %s latent frames, "
+            "overlap/halo=%s -> %s latent frames, anchors=%s, first_frame_sink=%s, fuse=%s",
+            context_schedule,
             context_length,
             latent_context_length,
             context_overlap,
             latent_context_overlap,
-            anchor_count if sampling_mode == _ANCHOR_MODE else 0,
+            anchor_count if context_schedule == _ANCHOR_SCHEDULE else 0,
             first_frame_sink,
-            context_schedule,
-            fuse_method,
+            effective_fuse_method,
         )
         return (patched,)
 
