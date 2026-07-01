@@ -37,7 +37,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
-W4_STORAGE_FIELDS = {"w4_qweight", "w4_scales", "w4_zeros"}
+W4_STORAGE_FIELDS = {"w4_qweight", "w4_scales", "w4_zeros", "w4_smooth"}
 W4_STORAGE_REQUIRED_FIELDS = {"w4_qweight", "w4_scales"}
 W4_STORAGE_GROUP_SIZE = 64
 SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
@@ -293,6 +293,18 @@ def _validate_w4_storage_layer_tensors(
                 f"expected {tuple(scales.shape)}"
             )
 
+    smooth = tensors.get("w4_smooth")
+    if smooth is not None:
+        if smooth.dtype != COMPUTE_DTYPE:
+            raise TypeError(f"W4 storage layer {name}.w4_smooth must be {COMPUTE_DTYPE}, got {smooth.dtype}")
+        if smooth.ndim != 1:
+            raise ValueError(f"W4 storage layer {name}.w4_smooth must be 1D, got shape {tuple(smooth.shape)}")
+        if int(smooth.shape[0]) != int(expected_in):
+            raise ValueError(
+                f"W4 storage layer {name}.w4_smooth shape mismatch: got {tuple(smooth.shape)}, "
+                f"expected ({expected_in},)"
+            )
+
 
 def _infer_w4_storage_group_size(name: str, in_features: int, group_count: int) -> int:
     if group_count <= 0:
@@ -321,7 +333,7 @@ def _packed_tensor_dtype(field: str) -> torch.dtype | None:
 
 
 def _w4_storage_tensor_dtype(field: str) -> torch.dtype | None:
-    if field in {"w4_scales", "w4_zeros"}:
+    if field in {"w4_scales", "w4_zeros", "w4_smooth"}:
         return COMPUTE_DTYPE
     return torch.uint8 if field == "w4_qweight" else None
 
@@ -516,19 +528,22 @@ class W4StorageParams:
     orig_dtype: torch.dtype
     orig_shape: tuple[int, int]
     zeros: torch.Tensor | None = None
+    smooth: torch.Tensor | None = None
     group_size: int = W4_STORAGE_GROUP_SIZE
     name: str = ""
 
     def _tensor_fields(self) -> tuple[str, ...]:
-        return ("scales", "zeros")
+        return ("scales", "zeros", "smooth")
 
     def to_device(self, device: torch.device) -> "W4StorageParams":
         zeros = None if self.zeros is None else self.zeros.to(device=device)
-        return dataclasses.replace(self, scales=self.scales.to(device=device), zeros=zeros)
+        smooth = None if self.smooth is None else self.smooth.to(device=device)
+        return dataclasses.replace(self, scales=self.scales.to(device=device), zeros=zeros, smooth=smooth)
 
     def clone(self) -> "W4StorageParams":
         zeros = None if self.zeros is None else self.zeros.clone()
-        return dataclasses.replace(self, scales=self.scales.clone(), zeros=zeros)
+        smooth = None if self.smooth is None else self.smooth.clone()
+        return dataclasses.replace(self, scales=self.scales.clone(), zeros=zeros, smooth=smooth)
 
     def copy_from(self, src: "W4StorageParams", non_blocking: bool = False) -> None:
         self.scales.copy_(src.scales, non_blocking=non_blocking)
@@ -536,6 +551,10 @@ class W4StorageParams:
             self.zeros.copy_(src.zeros, non_blocking=non_blocking)
         else:
             object.__setattr__(self, "zeros", src.zeros)
+        if self.smooth is not None and src.smooth is not None:
+            self.smooth.copy_(src.smooth, non_blocking=non_blocking)
+        else:
+            object.__setattr__(self, "smooth", src.smooth)
         object.__setattr__(self, "orig_dtype", src.orig_dtype)
         object.__setattr__(self, "orig_shape", src.orig_shape)
         object.__setattr__(self, "group_size", src.group_size)
@@ -562,6 +581,9 @@ def _dequantize_w4_storage(qdata: torch.Tensor, params: W4StorageParams) -> torc
         zeros = params.zeros.to(device=q.device, dtype=params.orig_dtype)
         expanded_zeros = zeros.repeat_interleave(params.group_size, dim=1)[:, :in_features]
         q.mul_(expanded_scales).add_(expanded_zeros)
+    if params.smooth is not None:
+        smooth = params.smooth.to(device=q.device, dtype=params.orig_dtype).clamp_min(torch.finfo(params.orig_dtype).tiny)
+        q.div_(smooth.view(1, in_features))
     return q.view(out_features, in_features)
 
 
@@ -579,9 +601,12 @@ class W4StorageLayout(QuantizedLayout):
     @classmethod
     def get_plain_tensors(cls, qtensor) -> tuple[torch.Tensor, ...]:
         params = qtensor._params
-        if params.zeros is None:
-            return (qtensor._qdata, params.scales)
-        return (qtensor._qdata, params.scales, params.zeros)
+        tensors = [qtensor._qdata, params.scales]
+        if params.zeros is not None:
+            tensors.append(params.zeros)
+        if params.smooth is not None:
+            tensors.append(params.smooth)
+        return tuple(tensors)
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: W4StorageParams) -> dict[str, torch.Tensor]:
@@ -591,6 +616,8 @@ class W4StorageLayout(QuantizedLayout):
         }
         if params.zeros is not None:
             tensors[".w4_zeros"] = params.zeros
+        if params.smooth is not None:
+            tensors[".w4_smooth"] = params.smooth
         return tensors
 
 
@@ -784,6 +811,9 @@ class W4StorageTensor:
         zeros = tensors.get("w4_zeros")
         if zeros is not None:
             zeros = zeros.contiguous()
+        smooth = tensors.get("w4_smooth")
+        if smooth is not None:
+            smooth = smooth.contiguous()
         group_size = _infer_w4_storage_group_size(name, self.in_features, int(scales.shape[1]))
         if _HAS_COMFY_QUANTIZED_TENSOR:
             params = W4StorageParams(
@@ -791,13 +821,14 @@ class W4StorageTensor:
                 orig_dtype=compute_dtype,
                 orig_shape=(self.out_features, self.in_features),
                 zeros=zeros,
+                smooth=smooth,
                 group_size=group_size,
                 name=name,
             )
             self.tensor = QuantizedTensor(qweight, W4_STORAGE_LAYOUT_NAME, params)
         else:
             self.tensor = None
-        self.packed_nbytes = _tensor_nbytes(qweight) + _tensor_nbytes(scales) + _tensor_nbytes(zeros)
+        self.packed_nbytes = _tensor_nbytes(qweight) + _tensor_nbytes(scales) + _tensor_nbytes(zeros) + _tensor_nbytes(smooth)
 
     @property
     def nbytes(self) -> int:
@@ -949,6 +980,8 @@ class SVDInt4LinearOp(comfy.ops.manual_cast.Linear):
             destination[prefix + "w4_scales"] = params.scales if keep_vars else params.scales.detach()
             if params.zeros is not None:
                 destination[prefix + "w4_zeros"] = params.zeros if keep_vars else params.zeros.detach()
+            if params.smooth is not None:
+                destination[prefix + "w4_smooth"] = params.smooth if keep_vars else params.smooth.detach()
             if self.bias is not None:
                 destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
             return
