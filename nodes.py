@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import inspect
 import math
 from pathlib import Path
 
@@ -433,102 +432,10 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
-def _filter_supported_kwargs(callable_obj, kwargs: dict) -> dict:
-    try:
-        params = inspect.signature(callable_obj).parameters
-    except (TypeError, ValueError):
-        return dict(kwargs)
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-        return dict(kwargs)
-    return {key: value for key, value in kwargs.items() if key in params}
-
-
-def _filter_context_handler_kwargs(kwargs: dict) -> dict:
-    filtered = _filter_supported_kwargs(comfy.context_windows.IndexListContextHandler, kwargs)
-    if len(filtered) == len(kwargs):
-        return filtered
-
-    params = set(filtered)
-    for key, value in kwargs.items():
-        if key in params:
-            continue
-        if value is None or value is False:
-            continue
-        if isinstance(value, (str, list, tuple, dict, set)) and not value:
-            continue
-        LOG.warning(
-            "Current ComfyUI IndexListContextHandler does not support %s; ignoring value %r.",
-            key,
-            value,
-        )
-    return filtered
-
-
-def _make_index_list_context_window(index_list: tuple[int, ...], *, dim: int, total_frames: int, context_overlap: int):
-    if not index_list:
-        raise ValueError("IndexListContextWindow requires at least one latent index.")
-    dim = int(dim)
-    total_frames = int(total_frames)
-    context_overlap = int(context_overlap)
-    kwargs = {
-        "dim": dim,
-        "total_frames": total_frames,
-        "context_overlap": context_overlap,
-    }
-    window_cls = comfy.context_windows.IndexListContextWindow
-    supported_kwargs = _filter_supported_kwargs(window_cls, kwargs)
-    try:
-        window = window_cls(list(index_list), **supported_kwargs)
-    except TypeError as exc:
-        if not supported_kwargs or "unexpected keyword" not in str(exc):
-            raise
-        window = window_cls(list(index_list))
-    window.dim = dim
-    window.total_frames = total_frames
-    window.context_length = len(index_list)
-    window.context_overlap = context_overlap
-    if total_frames > 0:
-        window.center_ratio = (min(index_list) + max(index_list)) / (2 * total_frames)
-    else:
-        window.center_ratio = 0.0
-    return window
-
-
-def _get_context_weights_compat(
-    length: int,
-    full_length: int,
-    idxs: list[int],
-    handler,
-    *,
-    sigma: torch.Tensor,
-    context_overlap: int,
-):
-    func = comfy.context_windows.get_context_weights
-    kwargs = _filter_supported_kwargs(
-        func,
-        {
-            "sigma": sigma,
-            "context_overlap": context_overlap,
-        },
-    )
-    if "context_overlap" in kwargs:
-        return func(length, full_length, idxs, handler, **kwargs)
-
-    old_context_overlap = getattr(handler, "context_overlap", None)
-    if old_context_overlap == context_overlap:
-        return func(length, full_length, idxs, handler, **kwargs)
-
-    handler.context_overlap = context_overlap
-    try:
-        return func(length, full_length, idxs, handler, **kwargs)
-    finally:
-        handler.context_overlap = old_context_overlap
-
-
 class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
     def __init__(self, *, first_frame_sink: bool, **kwargs):
         kwargs["causal_window_fix"] = False
-        super().__init__(**_filter_context_handler_kwargs(kwargs))
+        super().__init__(**kwargs)
         self.first_frame_sink = bool(first_frame_sink)
 
     def _build_context_window(
@@ -549,8 +456,8 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
             model_indices.add(0)
         model_indices = tuple(sorted(model_indices))
 
-        window = _make_index_list_context_window(
-            model_indices,
+        window = comfy.context_windows.IndexListContextWindow(
+            list(model_indices),
             dim=self.dim,
             total_frames=full_length,
             context_overlap=context_overlap,
@@ -608,7 +515,7 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
                     biases_final[i][index] = bias_total + bias
             return
 
-        weights = _get_context_weights_compat(
+        weights = comfy.context_windows.get_context_weights(
             len(write_indices),
             x_in.shape[self.dim],
             list(write_indices),
@@ -632,13 +539,12 @@ class BerniniScheduledContextHandler(BerniniContextHandlerBase):
         windows = []
         for window in super().get_context_windows(model, x_in, model_options):
             indices = tuple(int(index) for index in window.index_list)
-            context_overlap = getattr(window, "context_overlap", self.context_overlap)
             windows.append(
                 self._build_context_window(
                     target_indices=indices,
                     context_indices=indices,
                     full_length=full_length,
-                    context_overlap=context_overlap,
+                    context_overlap=window.context_overlap,
                 )
             )
         return windows
