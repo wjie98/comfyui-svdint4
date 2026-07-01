@@ -363,8 +363,24 @@ def _rope_encode_with_absolute_indices(
     img_ids[:, :, :, 0] = temporal.reshape(-1, 1, 1)
     img_ids[:, :, :, 1] = torch.linspace(h_start, h_len - 1 + h_start, steps_h, device=device, dtype=dtype).reshape(1, -1, 1)
     img_ids[:, :, :, 2] = torch.linspace(w_start, w_len - 1 + w_start, steps_w, device=device, dtype=dtype).reshape(1, 1, -1)
-    img_ids = img_ids.reshape(steps_t * steps_h * steps_w, 3)
-    return model.rope_embedder(img_ids).reshape(1, -1, model.dim // model.num_heads // 2, 2)
+    img_ids = img_ids.reshape(1, steps_t * steps_h * steps_w, img_ids.shape[-1])
+    freqs = model.rope_embedder(img_ids).movedim(1, 2)
+
+    if source_id:
+        from comfy.ldm.flux.math import rope
+
+        head_dim = model.dim // model.num_heads
+        pos = torch.tensor([[float(source_id)]], device=freqs.device, dtype=torch.float32)
+        id_rot = rope(pos, head_dim, model.rope_embedder.theta).reshape(
+            1,
+            1,
+            1,
+            head_dim // 2,
+            2,
+            2,
+        ).to(freqs.dtype)
+        freqs = torch.einsum("...ij,...jk->...ik", freqs, id_rot)
+    return freqs
 
 
 def _normalize_temporal_indices(indices, steps_t: int) -> torch.Tensor:
