@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 import math
 from pathlib import Path
 
@@ -416,10 +417,29 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
+def _filter_context_handler_kwargs(kwargs: dict) -> dict:
+    params = inspect.signature(comfy.context_windows.IndexListContextHandler).parameters
+    filtered = {}
+    for key, value in kwargs.items():
+        if key in params:
+            filtered[key] = value
+            continue
+        if value is None or value is False:
+            continue
+        if isinstance(value, (str, list, tuple, dict, set)) and not value:
+            continue
+        LOG.warning(
+            "Current ComfyUI IndexListContextHandler does not support %s; ignoring value %r.",
+            key,
+            value,
+        )
+    return filtered
+
+
 class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
     def __init__(self, *, first_frame_sink: bool, **kwargs):
         kwargs["causal_window_fix"] = False
-        super().__init__(**kwargs)
+        super().__init__(**_filter_context_handler_kwargs(kwargs))
         self.first_frame_sink = bool(first_frame_sink)
 
     def _build_context_window(
