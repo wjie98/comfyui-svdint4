@@ -494,6 +494,37 @@ def _make_index_list_context_window(index_list: tuple[int, ...], *, dim: int, to
     return window
 
 
+def _get_context_weights_compat(
+    length: int,
+    full_length: int,
+    idxs: list[int],
+    handler,
+    *,
+    sigma: torch.Tensor,
+    context_overlap: int,
+):
+    func = comfy.context_windows.get_context_weights
+    kwargs = _filter_supported_kwargs(
+        func,
+        {
+            "sigma": sigma,
+            "context_overlap": context_overlap,
+        },
+    )
+    if "context_overlap" in kwargs:
+        return func(length, full_length, idxs, handler, **kwargs)
+
+    old_context_overlap = getattr(handler, "context_overlap", None)
+    if old_context_overlap == context_overlap:
+        return func(length, full_length, idxs, handler, **kwargs)
+
+    handler.context_overlap = context_overlap
+    try:
+        return func(length, full_length, idxs, handler, **kwargs)
+    finally:
+        handler.context_overlap = old_context_overlap
+
+
 class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
     def __init__(self, *, first_frame_sink: bool, **kwargs):
         kwargs["causal_window_fix"] = False
@@ -577,7 +608,7 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
                     biases_final[i][index] = bias_total + bias
             return
 
-        weights = comfy.context_windows.get_context_weights(
+        weights = _get_context_weights_compat(
             len(write_indices),
             x_in.shape[self.dim],
             list(write_indices),
